@@ -1,4 +1,4 @@
-# 🛡️ GridMind: Distributed Cybersecurity Intelligence Grid
+SSSSSSS# 🛡️ GridMind: Distributed Cybersecurity Intelligence Grid
 
 ![Status](https://img.shields.io/badge/Status-Phase%202:%20Resilience-orange?style=flat-square)
 ![Java](https://img.shields.io/badge/Backend-Spring%20Boot%203-green?style=flat-square)

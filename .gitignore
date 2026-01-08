@@ -1,0 +1,22 @@
+# Java / Spring
+target/
+*.class
+*.jar
+.mvn/
+
+# Node / Angular
+node_modules/
+dist/
+.angular/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+
+# Data & Security (Crucial!)
+data/*
+!data/raw_samples/sample.txt
+*.pem
+*.key
+.env

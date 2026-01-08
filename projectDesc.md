@@ -91,3 +91,16 @@ cd gridmind-master
 mvn clean install
 mvn spring-boot:run
 # Server starts on port 8080. Zero Trust engine initializes.
+```
+### 2. Start the Network Controller (The Gatekeeper)
+```bash
+cd gridmind-net
+sudo python3 controller.py
+# Captive Portal active on Port 80.
+```
+### 3. Deploy a Worker (The Muscle)
+```bash
+cd gridmind-agent
+python3 worker.py
+# Agent connects to Master and awaits instructions.
+```

@@ -1,0 +1,19 @@
+<div class="launchpad">
+  <h3>Job Launchpad</h3>
+
+  <div class="drop-zone">
+    <input type="file" (change)="onFileSelected($event)" accept=".log">
+    <p>Selected File: {{ selectedFile ? selectedFile.name : 'None' }}</p>
+  </div>
+
+  <button
+    [disabled]="trustedNodeCount === 0 || !selectedFile"
+    (click)="startAnalysis()"
+    class="action-btn">
+    Start Analysis
+  </button>
+
+  <div class="terminal">
+    <div *ngFor="let log of logs" class="log-line">> {{ log }}</div>
+  </div>
+</div>

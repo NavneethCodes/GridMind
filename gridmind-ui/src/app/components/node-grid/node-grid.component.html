@@ -1,0 +1,18 @@
+<div class="grid-container">
+  <div *ngFor="let node of nodes"
+       class="node-card"
+       [ngClass]="'status-' + node.status.toLowerCase()">
+
+    <h3>{{ node.ip }}</h3>
+
+    <div class="status-label">
+      Status: <span [ngClass]="node.status.toLowerCase()">{{ node.status }}</span>
+    </div>
+
+    <div class="trust-section">
+      <span *ngIf="node.isTrusted" title="Trusted">🛡️ Trusted</span>
+      <span *ngIf="!node.isTrusted" title="Untrusted">💔 Untrusted</span>
+    </div>
+
+  </div>
+</div>

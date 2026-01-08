@@ -1,0 +1,50 @@
+/* Task 1: Grid Layout and Shield Update Colors */
+
+.grid-container {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr); // Creates the 2x2 grid
+  gap: 20px;
+  padding: 20px;
+}
+
+.node-card {
+  border: 2px solid #e0e0e0;
+  border-radius: 12px;
+  padding: 20px;
+  background-color: #ffffff;
+  transition: all 0.3s ease;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+  text-align: center;
+
+  /* Visual Rules: Dynamic Border Colors based on Status */
+  &.status-idle {
+    border-top: 6px solid #2ecc71; // Green
+  }
+
+  &.status-busy {
+    border-top: 6px solid #f1c40f; // Yellow
+  }
+
+  &.status-offline {
+    border-top: 6px solid #e74c3c; // Red
+    opacity: 0.7;
+  }
+}
+
+.status-label {
+  font-weight: bold;
+  font-size: 1.1rem;
+  margin: 10px 0;
+
+  /* Text color matching the rules */
+  .idle { color: #27ae60; }
+  .busy { color: #d35400; }
+  .offline { color: #c0392b; }
+}
+
+.trust-section {
+  margin-top: 15px;
+  padding-top: 10px;
+  border-top: 1px hide #eee;
+  font-size: 1.5rem; /* Makes the Shield icons large */
+}

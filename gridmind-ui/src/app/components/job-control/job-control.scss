@@ -1,0 +1,28 @@
+.launchpad { margin-top: 30px; border-top: 2px solid #eee; padding-top: 20px; }
+
+.drop-zone {
+  border: 2px dashed #007bff;
+  padding: 20px;
+  text-align: center;
+  background: #f0f7ff;
+}
+
+.action-btn {
+  width: 100%;
+  padding: 15px;
+  margin: 15px 0;
+  background: #28a745;
+  color: white;
+  border: none;
+  font-weight: bold;
+  &:disabled { background: #ccc; }
+}
+
+.terminal {
+  background: #000; // Black background for terminal
+  color: #00ff00;   // Green monospace text
+  font-family: monospace;
+  height: 150px;
+  padding: 10px;
+  overflow-y: auto; // Auto-scroll
+}

@@ -63,7 +63,10 @@ MASTER_IP = os.getenv('GRIDMIND_MASTER_IP') or os.getenv('MASTER_NODE_IP', '192.
 MASTER_LISTEN_PORT = int(os.getenv('GRIDMIND_MASTER_PORT') or os.getenv('MASTER_LISTEN_PORT', '5577'))
 WORKER_IP_START = 11
 SCAN_INTERVAL = 5  # seconds
-HEARTBEAT_TIMEOUT = int(os.getenv('GRIDMIND_HEARTBEAT_TIMEOUT', '12'))
+HEARTBEAT_INTERVAL_HINT = int(os.getenv('GRIDMIND_HEARTBEAT_INTERVAL', '10'))
+HEARTBEAT_TIMEOUT = int(os.getenv('GRIDMIND_HEARTBEAT_TIMEOUT', '30'))
+# Keep timeout above normal heartbeat cadence + command loop jitter.
+HEARTBEAT_TIMEOUT = max(HEARTBEAT_TIMEOUT, (HEARTBEAT_INTERVAL_HINT * 2) + 5)
 SHARED_SECRET = os.getenv('GRIDMIND_SHARED_SECRET', 'gridmind-dev-secret')
 AUTO_ONBOARD_ON_ANNOUNCE = os.getenv('GRIDMIND_AUTO_ONBOARD', 'true').lower() == 'true'
 WORKER_COMMAND_PORT = int(os.getenv('GRIDMIND_WORKER_COMMAND_PORT') or os.getenv('WORKER_LISTEN_PORT', '5556'))
@@ -81,6 +84,14 @@ BENCHMARK_ON_TOPOLOGY_CHANGE = os.getenv('GRIDMIND_BENCHMARK_ON_TOPOLOGY_CHANGE'
 BENCHMARK_REDISPATCH_COOLDOWN = int(os.getenv('GRIDMIND_BENCHMARK_REDISPATCH_COOLDOWN', '20'))
 MAX_ACTIVE_TASKS_PER_WORKER = int(os.getenv('GRIDMIND_MAX_ACTIVE_TASKS_PER_WORKER', '1'))
 CONSENT_EVERY_SESSION = os.getenv('GRIDMIND_CONSENT_EVERY_SESSION', 'true').lower() == 'true'
+
+# Dynamic cluster-share scoring (all active shares sum to 100)
+SCORE_CPU_WEIGHT = float(os.getenv('GRIDMIND_SCORE_CPU_WEIGHT', '0.75'))
+SCORE_MEM_WEIGHT = float(os.getenv('GRIDMIND_SCORE_MEM_WEIGHT', '0.15'))
+SCORE_NET_WEIGHT = float(os.getenv('GRIDMIND_SCORE_NET_WEIGHT', '0.10'))
+SCORE_MEM_SCALE = float(os.getenv('GRIDMIND_SCORE_MEM_SCALE', '100.0'))
+SCORE_NET_SCALE = float(os.getenv('GRIDMIND_SCORE_NET_SCALE', '10.0'))
+SCORE_GAMMA = float(os.getenv('GRIDMIND_SCORE_GAMMA', '1.2'))
 
 # Ensure directories exist
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
@@ -383,7 +394,7 @@ button {{ border:0; border-radius:8px; padding:10px 16px; font-weight:700; curso
                 worker_id = payload.get('worker_id')
 
                 if self.master_daemon:
-                    ok, reason = self.master_daemon.set_worker_join_state(worker_id, 'denied')
+                    ok, reason = self.master_daemon.safety_disconnect_worker(worker_id)
                 else:
                     ok, reason = False, 'master unavailable'
 
@@ -405,7 +416,7 @@ button {{ border:0; border-radius:8px; padding:10px 16px; font-weight:700; curso
                 raw = self.rfile.read(content_length).decode('utf-8')
                 params = urllib.parse.parse_qs(raw)
                 worker_id = (params.get('worker_id') or [None])[0]
-                decision = (params.get('decision') or ['deny'])[0]
+                decision = str((params.get('decision') or ['deny'])[0]).strip().lower()
 
                 if not worker_id:
                     worker_id = self.master_daemon.resolve_worker_id_by_ip(self.client_address[0])
@@ -413,6 +424,18 @@ button {{ border:0; border-radius:8px; padding:10px 16px; font-weight:700; curso
                 normalized = 'deny' if decision == 'leave' else decision
                 allowed = (normalized == 'allow')
                 ok, reason = self.master_daemon.set_worker_join_state(worker_id, 'allowed' if allowed else 'denied')
+
+                # Join pages can be opened with stale worker_id values in edge cases
+                # (cached tabs / old redirects). Retry once by requester IP.
+                if (not ok) and reason in ('worker not onboarded', 'worker_id not found for requester IP'):
+                    resolved_worker_id = self.master_daemon.resolve_worker_id_by_ip(self.client_address[0])
+                    if resolved_worker_id and resolved_worker_id != worker_id:
+                        ok, reason = self.master_daemon.set_worker_join_state(
+                            resolved_worker_id,
+                            'allowed' if allowed else 'denied'
+                        )
+                        worker_id = resolved_worker_id
+
                 if not ok:
                     self._send_html(400, f"<h1>Join update failed</h1><p>{reason}</p>")
                     return
@@ -511,7 +534,32 @@ class MasterDaemon:
                     self.fl_round_state = state.get('fl_round_state', self.fl_round_state)
                     self.task_state = state.get('task_state', self.task_state)
                     self.master_benchmark_report = state.get('master_benchmark_report', {})
-                    logger.info(f"Loaded state: {len(self.onboarded_workers)} workers onboarded")
+                    known_count = len(self.onboarded_workers)
+                    online_count = 0
+                    recently_seen_count = 0
+                    now = datetime.now()
+
+                    for worker in self.onboarded_workers.values():
+                        if worker.get('status') == 'online':
+                            online_count += 1
+
+                        last_seen_str = worker.get('last_seen')
+                        if not last_seen_str:
+                            continue
+                        try:
+                            last_seen = datetime.fromisoformat(last_seen_str)
+                        except Exception:
+                            continue
+                        if (now - last_seen).total_seconds() <= HEARTBEAT_TIMEOUT:
+                            recently_seen_count += 1
+
+                    logger.info(
+                        "Loaded state: %d known worker record(s) (%d online, %d seen within %ds)",
+                        known_count,
+                        online_count,
+                        recently_seen_count,
+                        HEARTBEAT_TIMEOUT,
+                    )
         except Exception as e:
             logger.error(f"Error loading state: {e}")
     
@@ -828,7 +876,8 @@ class MasterDaemon:
                         worker['status'] = 'pending'
                     if heartbeat.get('master_observed_ip'):
                         worker['observed_ip'] = heartbeat.get('master_observed_ip')
-                    if previous_status != 'online':
+                    # Only topology-bump when worker transitions into online.
+                    if worker.get('status') == 'online' and previous_status != 'online':
                         self.mark_topology_dirty('worker heartbeat online')
                     found = True
                     break
@@ -994,7 +1043,7 @@ class MasterDaemon:
         except Exception:
             return float(default)
 
-    def compute_worker_score(self, worker):
+    def _compute_worker_raw_strength(self, worker):
         benchmark = worker.get('benchmark_report', {})
         cpu_events = self._parse_cpu_benchmark(benchmark.get('cpu_benchmark'))
         network = benchmark.get('network', {}) if isinstance(benchmark.get('network'), dict) else {}
@@ -1003,15 +1052,90 @@ class MasterDaemon:
         cores = self._safe_float(benchmark.get('cpu_cores', 0), 0.0)
         memory = self._safe_float(benchmark.get('memory_gb', 0.0), 0.0)
 
-        # Weighted deterministic score for phase-1
-        score = (
-            cpu_events * 0.55 +
-            download * 0.15 +
-            upload * 0.05 +
-            cores * 4.0 +
-            memory * 1.5
+        # CPU benchmark is primary. If absent, fallback to a cores-derived proxy.
+        cpu_capacity = cpu_events if cpu_events > 0 else max(1.0, cores) * 1000.0
+        mem_capacity = max(0.0, memory) * SCORE_MEM_SCALE
+        net_capacity = max(0.0, (download * 0.7) + (upload * 0.3)) * SCORE_NET_SCALE
+
+        raw_strength = (
+            SCORE_CPU_WEIGHT * cpu_capacity +
+            SCORE_MEM_WEIGHT * mem_capacity +
+            SCORE_NET_WEIGHT * net_capacity
         )
-        return round(score, 2)
+        return {
+            'raw_strength': max(0.0, raw_strength),
+            'cpu_capacity': cpu_capacity,
+            'memory_capacity': mem_capacity,
+            'network_capacity': net_capacity
+        }
+
+    def compute_cluster_share_scores(self, workers):
+        """Return per-worker dynamic share scores whose total is always 100."""
+        if not workers:
+            return {}
+
+        rows = []
+        for worker in workers:
+            worker_id = worker.get('worker_id')
+            if not worker_id:
+                continue
+            components = self._compute_worker_raw_strength(worker)
+            raw_strength = components['raw_strength']
+            adjusted_strength = pow(raw_strength, SCORE_GAMMA) if raw_strength > 0 else 0.0
+            rows.append({
+                'worker_id': worker_id,
+                'raw_strength': raw_strength,
+                'adjusted_strength': adjusted_strength,
+                'cpu_capacity': components['cpu_capacity'],
+                'memory_capacity': components['memory_capacity'],
+                'network_capacity': components['network_capacity']
+            })
+
+        if not rows:
+            return {}
+
+        total_strength = sum(row['adjusted_strength'] for row in rows)
+        if total_strength <= 0:
+            equal_share = 100.0 / len(rows)
+            for row in rows:
+                row['worker_score'] = equal_share
+        else:
+            for row in rows:
+                row['worker_score'] = (row['adjusted_strength'] * 100.0) / total_strength
+
+        # Keep visible sum stable at 100.00 after rounding.
+        rounded_scores = [round(row['worker_score'], 2) for row in rows]
+        rounding_delta = round(100.0 - sum(rounded_scores), 2)
+        if rounded_scores:
+            rounded_scores[-1] = round(rounded_scores[-1] + rounding_delta, 2)
+
+        score_map = {}
+        for idx, row in enumerate(rows):
+            score_map[row['worker_id']] = {
+                'worker_score': rounded_scores[idx],
+                'worker_strength': round(row['adjusted_strength'], 2),
+                'worker_raw_strength': round(row['raw_strength'], 2),
+                'score_cpu_capacity': round(row['cpu_capacity'], 2),
+                'score_memory_capacity': round(row['memory_capacity'], 2),
+                'score_network_capacity': round(row['network_capacity'], 2)
+            }
+        return score_map
+
+    def _recompute_worker_scores_locked(self):
+        """Recompute and persist dynamic scores for currently active/allowed workers."""
+        online = []
+        for worker_id, worker in self.onboarded_workers.items():
+            if worker.get('status') == 'online' and worker.get('join_state', 'pending') == 'allowed':
+                online.append({
+                    'worker_id': worker_id,
+                    'benchmark_report': worker.get('benchmark_report', {})
+                })
+
+        score_map = self.compute_cluster_share_scores(online)
+        for worker_id, worker in self.onboarded_workers.items():
+            score_data = score_map.get(worker_id, {})
+            worker['worker_score'] = score_data.get('worker_score', 0.0)
+            worker['worker_strength'] = score_data.get('worker_strength', 0.0)
 
     def _get_online_workers(self):
         workers = []
@@ -1020,8 +1144,14 @@ class MasterDaemon:
                 if worker.get('status') == 'online' and worker.get('join_state', 'pending') == 'allowed':
                     worker_copy = dict(worker)
                     worker_copy['worker_id'] = worker_id
-                    worker_copy['worker_score'] = self.compute_worker_score(worker)
                     workers.append(worker_copy)
+
+        score_map = self.compute_cluster_share_scores(workers)
+        for worker in workers:
+            score_data = score_map.get(worker.get('worker_id'), {})
+            worker['worker_score'] = score_data.get('worker_score', 0.0)
+            worker['worker_strength'] = score_data.get('worker_strength', 0.0)
+            worker['worker_raw_strength'] = score_data.get('worker_raw_strength', 0.0)
 
         workers.sort(key=lambda w: w.get('worker_score', 0.0), reverse=True)
         return workers
@@ -1285,6 +1415,21 @@ class MasterDaemon:
         return True, 'result accepted'
 
     def get_workers_status(self):
+        online_ranked_workers = self._get_online_workers()
+
+        score_population = []
+        score_population.append({
+            'worker_id': self.master_id,
+            'benchmark_report': self.master_benchmark_report or {}
+        })
+        for worker in online_ranked_workers:
+            score_population.append({
+                'worker_id': worker.get('worker_id'),
+                'benchmark_report': worker.get('benchmark_report', {})
+            })
+
+        all_connected_score_map = self.compute_cluster_share_scores(score_population)
+
         with self.worker_lock:
             active_loads = {}
             for task in self.task_state.get('active_tasks', {}).values():
@@ -1293,10 +1438,7 @@ class MasterDaemon:
                     active_loads[wid] = active_loads.get(wid, 0) + 1
 
             workers = []
-
-            master_score = 0.0
-            if self.master_benchmark_report:
-                master_score = self.compute_worker_score({'benchmark_report': self.master_benchmark_report})
+            master_score = all_connected_score_map.get(self.master_id, {}).get('worker_score', 0.0)
 
             workers.append({
                 'worker_id': self.master_id,
@@ -1305,6 +1447,7 @@ class MasterDaemon:
                 'observed_ip': MASTER_IP,
                 'assigned_ip': MASTER_IP,
                 'worker_score': master_score,
+                'worker_strength': all_connected_score_map.get(self.master_id, {}).get('worker_strength', 0.0),
                 'canary_required': False,
                 'last_seen': datetime.now().isoformat(),
                 'active_tasks': 0,
@@ -1341,13 +1484,16 @@ class MasterDaemon:
                 else:
                     load_percent = min(100, int((active_tasks / max(1, MAX_ACTIVE_TASKS_PER_WORKER)) * 100))
 
+                dynamic_score = all_connected_score_map.get(worker_id, {})
+
                 workers.append({
                     'worker_id': worker_id,
                     'hostname': worker.get('hostname'),
                     'status': worker.get('status'),
                     'observed_ip': worker.get('observed_ip'),
                     'assigned_ip': worker.get('assigned_ip'),
-                    'worker_score': worker.get('worker_score', 0.0),
+                    'worker_score': dynamic_score.get('worker_score', 0.0),
+                    'worker_strength': dynamic_score.get('worker_strength', 0.0),
                     'canary_required': worker.get('canary_required', False),
                     'last_seen': worker.get('last_seen'),
                     'active_tasks': active_tasks,
@@ -1409,6 +1555,45 @@ class MasterDaemon:
         if should_refresh_benchmark:
             self.mark_topology_dirty('worker allowed')
         return True, 'updated'
+
+    def safety_disconnect_worker(self, worker_id):
+        """Force-end a worker session from dashboard safety switch.
+
+        Behavior:
+        - Sends terminate command to worker listener to stop the process.
+        - Marks worker denied/offline immediately for policy enforcement.
+        - If terminate command is ACKed, marks worker disconnected.
+        """
+        if not worker_id:
+            return False, 'worker_id is required'
+
+        worker_snapshot = None
+        with self.worker_lock:
+            worker = self.onboarded_workers.get(worker_id)
+            if not worker:
+                return False, 'worker not onboarded'
+            worker_snapshot = dict(worker)
+
+        cmd = {
+            'action': 'terminate_session',
+            'reason': 'safety_disconnect'
+        }
+        ok_cmd, cmd_reason = self._send_worker_command(worker_snapshot, cmd)
+
+        with self.worker_lock:
+            worker = self.onboarded_workers.get(worker_id)
+            if not worker:
+                return False, 'worker not onboarded'
+
+            worker['join_state'] = 'denied'
+            worker['status'] = 'disconnected' if ok_cmd else 'offline'
+            worker['join_state_updated_at'] = datetime.now().isoformat()
+            self.save_state()
+
+        self.mark_topology_dirty('worker safety disconnected')
+        if ok_cmd:
+            return True, 'worker session terminated'
+        return False, f'safety policy applied, but terminate command failed: {cmd_reason}'
 
     def get_cluster_overview(self):
         ok, workers_data, reason = self.get_workers_status()
@@ -1504,11 +1689,12 @@ class MasterDaemon:
                 'cpu_benchmark': report.get('cpu_benchmark'),
                 'network': report.get('network', {})
             }
-            target['worker_score'] = self.compute_worker_score(target)
             target['observed_ip'] = observed_ip or target.get('observed_ip')
             target['benchmark_updated_at'] = datetime.now().isoformat()
             target['last_seen'] = datetime.now().isoformat()
             target['status'] = 'online'
+
+            self._recompute_worker_scores_locked()
 
             self.save_state()
 

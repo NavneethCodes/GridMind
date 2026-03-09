@@ -185,6 +185,7 @@ class WorkerListenerDaemon:
         self.current_join_state = 'pending'
         self.redirect_server = None
         self.redirect_thread = None
+        self.command_listener = None
         self.http_redirect_active = False
         self.join_page_launched_for_session = False
         self.last_join_page_launch_ts = 0
@@ -496,18 +497,24 @@ class WorkerListenerDaemon:
     
     def detect_master_presence(self):
         """
-        Check if master is on the network by trying to connect
-        Uses ping to quickly check if master IP responds
+        Check if master is reachable.
+        Prefer TCP connect to master API port (real service reachability),
+        then fall back to ping for environments where port probes fail.
         """
         try:
-            result = subprocess.run(
-                ['ping', '-c', '1', '-W', '2', MASTER_IP],
-                capture_output=True,
-                timeout=5
-            )
-            return result.returncode == 0
-        except:
-            return False
+            sock = socket.create_connection((MASTER_IP, MASTER_LISTEN_PORT), timeout=2)
+            sock.close()
+            return True
+        except Exception:
+            try:
+                result = subprocess.run(
+                    ['ping', '-c', '1', '-W', '2', MASTER_IP],
+                    capture_output=True,
+                    timeout=5
+                )
+                return result.returncode == 0
+            except Exception:
+                return False
     
     def announce_to_master(self):
         """
@@ -681,14 +688,16 @@ class WorkerListenerDaemon:
         
         try:
             import socket as sock
-            
-            listener = sock.socket(sock.AF_INET, sock.SOCK_STREAM)
-            listener.setsockopt(sock.SOL_SOCKET, sock.SO_REUSEADDR, 1)
-            listener.bind(('0.0.0.0', WORKER_LISTEN_PORT))
-            listener.listen(1)
-            listener.settimeout(10)  # short timeout to keep loop responsive
-            
-            conn, addr = listener.accept()
+
+            if self.command_listener is None:
+                self.command_listener = sock.socket(sock.AF_INET, sock.SOCK_STREAM)
+                self.command_listener.setsockopt(sock.SOL_SOCKET, sock.SO_REUSEADDR, 1)
+                self.command_listener.bind(('0.0.0.0', WORKER_LISTEN_PORT))
+                self.command_listener.listen(8)
+
+            self.command_listener.settimeout(10)  # short timeout to keep loop responsive
+
+            conn, addr = self.command_listener.accept()
             logger.info(f"Received connection from {addr}")
             
             data = b''
@@ -707,21 +716,18 @@ class WorkerListenerDaemon:
                 ack = self._command_ack('error', None, 'missing message_id')
                 conn.sendall(json.dumps(ack).encode('utf-8'))
                 conn.close()
-                listener.close()
                 return None
 
             if not verify_payload_checksum(command):
                 ack = self._command_ack('error', message_id, 'invalid checksum')
                 conn.sendall(json.dumps(ack).encode('utf-8'))
                 conn.close()
-                listener.close()
                 return None
 
             if message_id in self.processed_message_ids or message_id in self.in_progress_message_ids:
                 ack = self._command_ack('duplicate', message_id, 'already processed/in-progress')
                 conn.sendall(json.dumps(ack).encode('utf-8'))
                 conn.close()
-                listener.close()
                 return None
 
             self.in_progress_message_ids.add(message_id)
@@ -729,7 +735,6 @@ class WorkerListenerDaemon:
             conn.sendall(json.dumps(ack).encode('utf-8'))
 
             conn.close()
-            listener.close()
 
             logger.info(f"Received command: {command.get('action')} ({message_id})")
             return command
@@ -739,7 +744,22 @@ class WorkerListenerDaemon:
             return None
         except Exception as e:
             logger.error(f"Error waiting for command: {e}")
+            if self.command_listener is not None:
+                try:
+                    self.command_listener.close()
+                except Exception:
+                    pass
+                self.command_listener = None
             return None
+
+    def stop_command_listener(self):
+        if self.command_listener is None:
+            return
+        try:
+            self.command_listener.close()
+        except Exception:
+            pass
+        self.command_listener = None
     
     def execute_bootstrap(self, bootstrap_script_path, password):
         """
@@ -852,6 +872,11 @@ class WorkerListenerDaemon:
                             master_url = command.get('master_url')
                             if master_url:
                                 action_ok = self.run_and_send_benchmark(master_url)
+                        elif action == 'terminate_session':
+                            logger.info("Safety disconnect received from master; terminating worker session")
+                            self.shutdown_requested = True
+                            self.running = False
+                            action_ok = True
 
                         if message_id:
                             if action_ok:
@@ -884,6 +909,7 @@ class WorkerListenerDaemon:
     def _finalize_shutdown(self):
         self.set_http_redirect(False)
         self.stop_redirect_server()
+        self.stop_command_listener()
         self.save_state()
     
     def shutdown(self, signum=None, frame=None):

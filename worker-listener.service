@@ -1,0 +1,27 @@
+[Unit]
+Description=GridMind Worker Listener Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/GridMind
+ExecStart=/usr/bin/python3 %h/GridMind/worker-listener-daemon.py
+Restart=always
+RestartSec=5
+
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gridmind-worker
+
+MemoryLimit=128M
+CPUQuota=25%
+
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

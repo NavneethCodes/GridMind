@@ -1,0 +1,48 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+myenv/
+GridMinds/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs and runtime artifacts
+logs/
+master_logs/
+*.log
+agent_log.txt
+worker_listener.log
+
+# State / generated runtime files
+master_state.json
+agent_report.json
+*.pid
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# IDE/editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Optional data and temp folders
+tmp/
+.cache/

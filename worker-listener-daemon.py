@@ -191,7 +191,12 @@ class WorkerListenerDaemon:
         self.last_join_page_launch_ts = 0
         self.task_in_progress = False
         self.shutdown_requested = False
+        self.last_benchmark_report = {}
+        self.cpu_prev_total = None
+        self.cpu_prev_idle = None
         self.load_state()
+        # Prime CPU sampling baseline for heartbeat telemetry.
+        self._read_cpu_usage_percent()
         logger.info(f"Worker Listener initialized - ID: {self.worker_id}, MAC: {self.mac_address}")
 
     def load_state(self):
@@ -204,6 +209,7 @@ class WorkerListenerDaemon:
                 self.link_metrics = state.get('link_metrics', self.link_metrics)
                 self.user_consent_granted = bool(state.get('user_consent_granted', False))
                 self.current_join_state = state.get('current_join_state', 'pending')
+                self.last_benchmark_report = state.get('last_benchmark_report', {}) or {}
         except Exception as e:
             logger.warning(f"Could not load listener state: {e}")
 
@@ -218,12 +224,95 @@ class WorkerListenerDaemon:
                 'link_metrics': self.link_metrics,
                 'user_consent_granted': self.user_consent_granted,
                 'current_join_state': self.current_join_state,
+                'last_benchmark_report': self.last_benchmark_report,
                 'updated_at': datetime.now().isoformat()
             }
             with open(STATE_FILE, 'w') as f:
                 json.dump(state, f, indent=2)
         except Exception as e:
             logger.warning(f"Could not save listener state: {e}")
+
+    def _read_cpu_usage_percent(self):
+        try:
+            with open('/proc/stat', 'r') as f:
+                first = f.readline().strip().split()
+            if len(first) < 5 or first[0] != 'cpu':
+                return 0.0
+
+            values = [int(v) for v in first[1:]]
+            idle = values[3] + (values[4] if len(values) > 4 else 0)
+            total = sum(values)
+
+            if self.cpu_prev_total is None or self.cpu_prev_idle is None:
+                self.cpu_prev_total = total
+                self.cpu_prev_idle = idle
+                return 0.0
+
+            delta_total = total - self.cpu_prev_total
+            delta_idle = idle - self.cpu_prev_idle
+            self.cpu_prev_total = total
+            self.cpu_prev_idle = idle
+
+            if delta_total <= 0:
+                return 0.0
+
+            usage = (1.0 - (delta_idle / float(delta_total))) * 100.0
+            return round(max(0.0, min(100.0, usage)), 2)
+        except Exception:
+            return 0.0
+
+    def _read_memory_stats(self):
+        mem_total_kb = 0.0
+        mem_available_kb = 0.0
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if line.startswith('MemTotal:'):
+                        mem_total_kb = float(line.split()[1])
+                    elif line.startswith('MemAvailable:'):
+                        mem_available_kb = float(line.split()[1])
+            if mem_total_kb <= 0:
+                return 0.0, 0.0, 0.0
+
+            used_kb = max(0.0, mem_total_kb - mem_available_kb)
+            used_pct = round((used_kb / mem_total_kb) * 100.0, 2)
+            total_gb = round(mem_total_kb / (1024.0 * 1024.0), 2)
+            available_gb = round(mem_available_kb / (1024.0 * 1024.0), 2)
+            return used_pct, total_gb, available_gb
+        except Exception:
+            return 0.0, 0.0, 0.0
+
+    def _build_live_metrics(self):
+        mem_used_pct, _, mem_available_gb = self._read_memory_stats()
+        load_1m = 0.0
+        try:
+            load_1m = round(float(os.getloadavg()[0]), 2)
+        except Exception:
+            load_1m = 0.0
+
+        return {
+            'cpu_usage_percent': self._read_cpu_usage_percent(),
+            'memory_usage_percent': mem_used_pct,
+            'memory_available_gb': mem_available_gb,
+            'load_1m': load_1m,
+            'timestamp': datetime.now().isoformat()
+        }
+
+    def _build_score_inputs_snapshot(self):
+        _, memory_total_gb, _ = self._read_memory_stats()
+        network = {}
+        if isinstance(self.last_benchmark_report, dict):
+            network = self.last_benchmark_report.get('network', {}) or {}
+
+        return {
+            'cpu_cores': int(os.cpu_count() or 1),
+            'memory_gb': memory_total_gb,
+            'cpu_benchmark': self.last_benchmark_report.get('cpu_benchmark') if isinstance(self.last_benchmark_report, dict) else None,
+            'network': {
+                'download_mbps': network.get('download_mbps', 0.0),
+                'upload_mbps': network.get('upload_mbps', 0.0)
+            }
+        }
 
     def _run_cmd_ok(self, cmd):
         try:
@@ -566,7 +655,9 @@ class WorkerListenerDaemon:
             'worker_id': self.worker_id,
             'mac_address': self.mac_address,
             'hostname': self.hostname,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'live_metrics': self._build_live_metrics(),
+            'score_inputs': self._build_score_inputs_snapshot()
         }
         payload['checksum'] = sign_payload(payload)
 
@@ -673,6 +764,13 @@ class WorkerListenerDaemon:
             'timestamp': datetime.now().isoformat()
         }
         report['checksum'] = sign_payload(report)
+
+        # Keep latest benchmark inputs for lightweight heartbeat snapshots.
+        self.last_benchmark_report = {
+            'cpu_benchmark': report.get('cpu_benchmark'),
+            'network': report.get('network', {})
+        }
+        self.save_state()
 
         ok = self.post_or_queue(master_url, report, 'benchmark-report')
         if ok:

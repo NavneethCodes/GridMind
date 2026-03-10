@@ -478,8 +478,11 @@ class MasterDaemon:
         self.topology_dirty = True
         self.last_benchmark_dispatch_at = 0
         self.master_benchmark_report = {}
+        self.master_cpu_prev_total = None
+        self.master_cpu_prev_idle = None
         self.load_state()
         self.collect_master_benchmark()
+        self._read_local_cpu_usage_percent()
         self.reset_worker_trust_for_new_session()
         logger.info(f"GridMind Master Daemon initialized - ID: {self.master_id}")
 
@@ -595,6 +598,69 @@ class MasterDaemon:
             return float(os.cpu_count() or 1) * 1000.0
         except Exception:
             return float(os.cpu_count() or 1) * 1000.0
+
+    def _read_local_cpu_usage_percent(self):
+        try:
+            with open('/proc/stat', 'r') as f:
+                first = f.readline().strip().split()
+            if len(first) < 5 or first[0] != 'cpu':
+                return 0.0
+
+            values = [int(v) for v in first[1:]]
+            idle = values[3] + (values[4] if len(values) > 4 else 0)
+            total = sum(values)
+
+            if self.master_cpu_prev_total is None or self.master_cpu_prev_idle is None:
+                self.master_cpu_prev_total = total
+                self.master_cpu_prev_idle = idle
+                return 0.0
+
+            delta_total = total - self.master_cpu_prev_total
+            delta_idle = idle - self.master_cpu_prev_idle
+            self.master_cpu_prev_total = total
+            self.master_cpu_prev_idle = idle
+
+            if delta_total <= 0:
+                return 0.0
+
+            usage = (1.0 - (delta_idle / float(delta_total))) * 100.0
+            return round(max(0.0, min(100.0, usage)), 2)
+        except Exception:
+            return 0.0
+
+    def _read_local_memory_stats(self):
+        mem_total_kb = 0.0
+        mem_available_kb = 0.0
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if line.startswith('MemTotal:'):
+                        mem_total_kb = float(line.split()[1])
+                    elif line.startswith('MemAvailable:'):
+                        mem_available_kb = float(line.split()[1])
+            if mem_total_kb <= 0:
+                return 0.0, 0.0
+
+            used_pct = ((mem_total_kb - mem_available_kb) / mem_total_kb) * 100.0
+            available_gb = mem_available_kb / (1024.0 * 1024.0)
+            return round(max(0.0, min(100.0, used_pct)), 2), round(max(0.0, available_gb), 2)
+        except Exception:
+            return 0.0, 0.0
+
+    def _collect_local_live_metrics(self):
+        mem_used_pct, mem_available_gb = self._read_local_memory_stats()
+        load_1m = 0.0
+        try:
+            load_1m = round(float(os.getloadavg()[0]), 2)
+        except Exception:
+            load_1m = 0.0
+        return {
+            'cpu_usage_percent': self._read_local_cpu_usage_percent(),
+            'memory_usage_percent': mem_used_pct,
+            'memory_available_gb': mem_available_gb,
+            'load_1m': load_1m,
+            'timestamp': datetime.now().isoformat()
+        }
 
     def collect_master_benchmark(self):
         memory_gb = 0.0
@@ -867,6 +933,42 @@ class MasterDaemon:
                 if worker.get('worker_id') == worker_id:
                     previous_status = worker.get('status')
                     worker['last_seen'] = heartbeat_time
+                    if isinstance(heartbeat.get('live_metrics'), dict):
+                        worker['live_metrics'] = heartbeat.get('live_metrics')
+
+                    score_inputs = heartbeat.get('score_inputs') if isinstance(heartbeat.get('score_inputs'), dict) else {}
+                    if score_inputs:
+                        benchmark = worker.get('benchmark_report', {}) if isinstance(worker.get('benchmark_report'), dict) else {}
+                        before = (
+                            benchmark.get('cpu_cores'),
+                            benchmark.get('memory_gb'),
+                            benchmark.get('cpu_benchmark'),
+                            (benchmark.get('network') or {}).get('download_mbps') if isinstance(benchmark.get('network'), dict) else None,
+                            (benchmark.get('network') or {}).get('upload_mbps') if isinstance(benchmark.get('network'), dict) else None,
+                        )
+
+                        benchmark['cpu_cores'] = score_inputs.get('cpu_cores', benchmark.get('cpu_cores'))
+                        benchmark['memory_gb'] = score_inputs.get('memory_gb', benchmark.get('memory_gb'))
+                        benchmark['cpu_benchmark'] = score_inputs.get('cpu_benchmark', benchmark.get('cpu_benchmark'))
+                        incoming_network = score_inputs.get('network') if isinstance(score_inputs.get('network'), dict) else {}
+                        prev_network = benchmark.get('network') if isinstance(benchmark.get('network'), dict) else {}
+                        benchmark['network'] = {
+                            'download_mbps': incoming_network.get('download_mbps', prev_network.get('download_mbps', 0.0)),
+                            'upload_mbps': incoming_network.get('upload_mbps', prev_network.get('upload_mbps', 0.0))
+                        }
+                        worker['benchmark_report'] = benchmark
+
+                        after = (
+                            benchmark.get('cpu_cores'),
+                            benchmark.get('memory_gb'),
+                            benchmark.get('cpu_benchmark'),
+                            benchmark['network'].get('download_mbps'),
+                            benchmark['network'].get('upload_mbps'),
+                        )
+                        if before != after:
+                            worker['benchmark_updated_at'] = heartbeat_time
+                            self._recompute_worker_scores_locked()
+
                     join_state = worker.get('join_state', 'pending')
                     if join_state == 'allowed':
                         worker['status'] = 'online'
@@ -887,6 +989,8 @@ class MasterDaemon:
                     if worker.get('worker_id') == worker_id:
                         worker['last_seen'] = heartbeat_time
                         worker['status'] = 'online'
+                        if isinstance(heartbeat.get('live_metrics'), dict):
+                            worker['live_metrics'] = heartbeat.get('live_metrics')
                         found = True
                         break
 
@@ -899,7 +1003,8 @@ class MasterDaemon:
                     'hostname': heartbeat.get('hostname', 'unknown'),
                     'announced_at': heartbeat_time,
                     'last_seen': heartbeat_time,
-                    'status': 'online'
+                    'status': 'online',
+                    'live_metrics': heartbeat.get('live_metrics', {}) if isinstance(heartbeat.get('live_metrics'), dict) else {}
                 }
 
             self.save_state()
@@ -1448,6 +1553,9 @@ class MasterDaemon:
                 'assigned_ip': MASTER_IP,
                 'worker_score': master_score,
                 'worker_strength': all_connected_score_map.get(self.master_id, {}).get('worker_strength', 0.0),
+                'score_cpu_capacity': all_connected_score_map.get(self.master_id, {}).get('score_cpu_capacity', 0.0),
+                'score_memory_capacity': all_connected_score_map.get(self.master_id, {}).get('score_memory_capacity', 0.0),
+                'score_network_capacity': all_connected_score_map.get(self.master_id, {}).get('score_network_capacity', 0.0),
                 'canary_required': False,
                 'last_seen': datetime.now().isoformat(),
                 'active_tasks': 0,
@@ -1455,7 +1563,15 @@ class MasterDaemon:
                 'activity_state': 'master',
                 'join_state': 'allowed',
                 'is_master': True,
-                'benchmark_updated_at': self.master_benchmark_report.get('timestamp')
+                'benchmark_updated_at': self.master_benchmark_report.get('timestamp'),
+                'benchmark_report': self.master_benchmark_report or {},
+                'score_inputs': {
+                    'cpu_cores': (self.master_benchmark_report or {}).get('cpu_cores'),
+                    'memory_gb': (self.master_benchmark_report or {}).get('memory_gb'),
+                    'cpu_benchmark': (self.master_benchmark_report or {}).get('cpu_benchmark'),
+                    'network': ((self.master_benchmark_report or {}).get('network') or {})
+                },
+                'live_metrics': self._collect_local_live_metrics()
             })
 
             for worker_id, worker in self.onboarded_workers.items():
@@ -1494,6 +1610,9 @@ class MasterDaemon:
                     'assigned_ip': worker.get('assigned_ip'),
                     'worker_score': dynamic_score.get('worker_score', 0.0),
                     'worker_strength': dynamic_score.get('worker_strength', 0.0),
+                    'score_cpu_capacity': dynamic_score.get('score_cpu_capacity', 0.0),
+                    'score_memory_capacity': dynamic_score.get('score_memory_capacity', 0.0),
+                    'score_network_capacity': dynamic_score.get('score_network_capacity', 0.0),
                     'canary_required': worker.get('canary_required', False),
                     'last_seen': worker.get('last_seen'),
                     'active_tasks': active_tasks,
@@ -1501,7 +1620,15 @@ class MasterDaemon:
                     'activity_state': activity_state,
                     'join_state': worker.get('join_state', 'pending'),
                     'is_master': False,
-                    'benchmark_updated_at': worker.get('benchmark_updated_at')
+                    'benchmark_updated_at': worker.get('benchmark_updated_at'),
+                    'benchmark_report': worker.get('benchmark_report', {}),
+                    'score_inputs': {
+                        'cpu_cores': (worker.get('benchmark_report') or {}).get('cpu_cores') if isinstance(worker.get('benchmark_report'), dict) else None,
+                        'memory_gb': (worker.get('benchmark_report') or {}).get('memory_gb') if isinstance(worker.get('benchmark_report'), dict) else None,
+                        'cpu_benchmark': (worker.get('benchmark_report') or {}).get('cpu_benchmark') if isinstance(worker.get('benchmark_report'), dict) else None,
+                        'network': ((worker.get('benchmark_report') or {}).get('network') or {}) if isinstance(worker.get('benchmark_report'), dict) else {}
+                    },
+                    'live_metrics': worker.get('live_metrics', {})
                 })
 
             data = {

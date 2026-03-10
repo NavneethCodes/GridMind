@@ -41,6 +41,25 @@
     .state { font-weight: 600; text-transform: capitalize; }
     .bar { height: 8px; background: #1f2937; border-radius: 999px; overflow: hidden; margin-top: 8px; }
     .fill { height: 100%; background: var(--blue); width: 0%; transition: width .25s ease; }
+    .meter-wrap { margin-top: 8px; }
+    .meter-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 6px; }
+    .meter-label { font-size: .78rem; color: #cbd5e1; }
+    .meter-value { font-size: .78rem; color: #a7f3d0; font-weight: 700; }
+    .meter-track {
+      height: 9px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: linear-gradient(90deg, #0f2a1d 0%, #133123 55%, #163b28 100%);
+      border: 1px solid #1d3b2d;
+      margin-top: 4px;
+    }
+    .meter-fill {
+      height: 100%;
+      width: 0%;
+      border-radius: 999px;
+      transition: width .35s ease;
+      box-shadow: 0 0 8px rgba(52, 211, 153, 0.35);
+    }
     .small { font-size: .8rem; color: var(--muted); margin-top: 6px; }
     .small-actions { display:flex; gap:8px; margin-top:10px; }
     .tiny-btn {
@@ -99,11 +118,64 @@
       return `<span class="dot ${cls}"></span>${st}`;
     }
 
+    function formatDateTime(ts) {
+      if (!ts) return 'n/a';
+      const d = new Date(ts);
+      if (Number.isNaN(d.getTime())) return ts;
+
+      const dd = String(d.getDate()).padStart(2, '0');
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const yyyy = d.getFullYear();
+
+      let hour = d.getHours();
+      const min = String(d.getMinutes()).padStart(2, '0');
+      const ampm = hour >= 12 ? 'pm' : 'am';
+      hour = hour % 12;
+      hour = hour === 0 ? 12 : hour;
+      const hh = String(hour).padStart(2, '0');
+
+      return `${dd}/${mm}/${yyyy} ${hh}:${min}${ampm}`;
+    }
+
     function workerCard(w) {
       const st = w.activity_state || 'offline';
       const isMaster = Boolean(w.is_master);
       const score = Number(w.worker_score || 0).toFixed(2);
       const load = Number(w.load_percent || 0);
+      const lm = w.live_metrics || {};
+      const si = w.score_inputs || {};
+      const cpuNow = Number(lm.cpu_usage_percent || 0).toFixed(1);
+      const ramNow = Number(lm.memory_usage_percent || 0).toFixed(1);
+      const cores = si.cpu_cores ?? 'n/a';
+      const memGb = (si.memory_gb !== undefined && si.memory_gb !== null)
+        ? Number(si.memory_gb).toFixed(1)
+        : 'n/a';
+      const cpuBench = si.cpu_benchmark || 'n/a';
+      const net = si.network || {};
+      const dl = Number(net.download_mbps || 0).toFixed(1);
+      const ul = Number(net.upload_mbps || 0).toFixed(1);
+
+      const clampPercent = (v) => Math.max(0, Math.min(100, Number(v || 0)));
+      const pickMeterColor = (value) => {
+        const v = clampPercent(value);
+        if (v < 35) return '#166534';     // dark green
+        if (v < 65) return '#22c55e';     // green
+        if (v < 85) return '#86efac';     // light green
+        return '#f59e0b';                 // amber when very high
+      };
+      const meterHtml = (label, value) => {
+        const pct = clampPercent(value);
+        const color = pickMeterColor(pct);
+        return `
+          <div class="meter-row">
+            <span class="meter-label">${label}</span>
+            <span class="meter-value">${pct.toFixed(1)}%</span>
+          </div>
+          <div class="meter-track">
+            <div class="meter-fill" style="width:${pct}%; background:${color};"></div>
+          </div>
+        `;
+      };
       const dotClass = isMaster
         ? 'master'
         : (st === 'available'
@@ -117,6 +189,8 @@
       const actionHtml = isMaster
         ? ''
         : `<div class="small-actions"><button class="tiny-btn" onclick="disconnectWorker('${w.worker_id}')">Safety Disconnect</button></div>`;
+      const lastSeenText = formatDateTime(w.last_seen);
+      const benchmarkUpdatedText = formatDateTime(w.benchmark_updated_at);
 
       return `
         <div class="${cardClass}">
@@ -130,10 +204,19 @@
           <div class="small">IP: ${w.observed_ip || w.assigned_ip || 'n/a'}</div>
           <div class="small">Score: ${score} | Active Tasks: ${w.active_tasks || 0}</div>
           <div class="small">Join Decision: ${(w.join_state || 'pending')}</div>
+          <div class="small">Live: CPU ${cpuNow}% | RAM ${ramNow}%</div>
+          <div class="meter-wrap">
+            ${meterHtml('CPU Usage', cpuNow)}
+            ${meterHtml('RAM Usage', ramNow)}
+            ${meterHtml('Worker Load', load)}
+            ${meterHtml('Score Share', score)}
+          </div>
+          <div class="small">Score Inputs: Cores ${cores} | Mem ${memGb} GB</div>
+          <div class="small">CPU Bench: ${cpuBench}</div>
+          <div class="small">Net Inputs: Down ${dl} Mbps | Up ${ul} Mbps</div>
           ${actionHtml}
-          <div class="bar"><div class="fill" style="width:${load}%"></div></div>
-          <div class="small">Load: ${load}% | Last seen: ${w.last_seen || 'n/a'}</div>
-          <div class="small">Benchmark Updated: ${w.benchmark_updated_at || 'n/a'}</div>
+          <div class="small">Load: ${load}% | Last seen: ${lastSeenText}</div>
+          <div class="small">Benchmark Updated: ${benchmarkUpdatedText}</div>
         </div>
       `;
     }

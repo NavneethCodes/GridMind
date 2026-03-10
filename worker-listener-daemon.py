@@ -20,6 +20,7 @@ from datetime import datetime
 import signal
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import uuid
 
 
 def _load_env_file(path):
@@ -49,6 +50,7 @@ WORKER_HOME = os.path.expanduser('~')
 GRIDMIND_DIR = os.path.join(WORKER_HOME, '.gridmind')
 LOG_FILE = os.path.join(GRIDMIND_DIR, 'worker_listener.log')
 STATE_FILE = os.path.join(GRIDMIND_DIR, 'listener_state.json')
+PROJECT_VERSION = "1.0.2"
 
 # Master discovery
 MASTER_IP = os.getenv('GRIDMIND_MASTER_IP') or os.getenv('MASTER_NODE_IP', '192.168.0.10')
@@ -89,6 +91,10 @@ def _canonical_json(payload):
 
 def sign_payload(payload):
     return hashlib.sha256((SHARED_SECRET + _canonical_json(payload)).encode()).hexdigest()
+
+
+def result_signature(worker_id, task_id, result_hash):
+    return hashlib.sha256((SHARED_SECRET + str(worker_id) + str(task_id) + str(result_hash)).encode('utf-8')).hexdigest()
 
 
 def verify_payload_checksum(payload):
@@ -194,6 +200,8 @@ class WorkerListenerDaemon:
         self.last_benchmark_report = {}
         self.cpu_prev_total = None
         self.cpu_prev_idle = None
+        self.session_token = None
+        self.session_token_expires_at_epoch = 0
         self.load_state()
         # Prime CPU sampling baseline for heartbeat telemetry.
         self._read_cpu_usage_percent()
@@ -210,6 +218,8 @@ class WorkerListenerDaemon:
                 self.user_consent_granted = bool(state.get('user_consent_granted', False))
                 self.current_join_state = state.get('current_join_state', 'pending')
                 self.last_benchmark_report = state.get('last_benchmark_report', {}) or {}
+                self.session_token = state.get('session_token')
+                self.session_token_expires_at_epoch = int(state.get('session_token_expires_at_epoch', 0) or 0)
         except Exception as e:
             logger.warning(f"Could not load listener state: {e}")
 
@@ -225,6 +235,8 @@ class WorkerListenerDaemon:
                 'user_consent_granted': self.user_consent_granted,
                 'current_join_state': self.current_join_state,
                 'last_benchmark_report': self.last_benchmark_report,
+                'session_token': self.session_token,
+                'session_token_expires_at_epoch': self.session_token_expires_at_epoch,
                 'updated_at': datetime.now().isoformat()
             }
             with open(STATE_FILE, 'w') as f:
@@ -313,6 +325,75 @@ class WorkerListenerDaemon:
                 'upload_mbps': network.get('upload_mbps', 0.0)
             }
         }
+
+    def _refresh_worker_token(self):
+        try:
+            payload = {
+                'worker_id': self.worker_id,
+                'timestamp': datetime.now().isoformat(),
+                'message_id': f"tok-{uuid.uuid4().hex[:12]}"
+            }
+            payload['checksum'] = sign_payload(payload)
+            result = subprocess.run([
+                'curl', '-sS', '-X', 'POST',
+                f'http://{MASTER_IP}:{MASTER_LISTEN_PORT}/api/worker/token/refresh',
+                '-H', 'Content-Type: application/json',
+                '-d', json.dumps(payload),
+                '--connect-timeout', '4',
+                '--max-time', '10'
+            ], capture_output=True, text=True, timeout=12)
+
+            if result.returncode != 0:
+                logger.warning(f"Token refresh failed: {result.stderr.strip() or result.stdout.strip()}")
+                return False
+
+            data = json.loads(result.stdout or '{}')
+            if data.get('status') != 'ok':
+                logger.warning(f"Token refresh rejected: {data.get('reason')}")
+                return False
+
+            token_data = data.get('data') or {}
+            token = token_data.get('auth_token')
+            exp = int(token_data.get('token_expires_at_epoch') or 0)
+            if not token or exp <= 0:
+                logger.warning("Token refresh response missing token")
+                return False
+
+            self.session_token = token
+            self.session_token_expires_at_epoch = exp
+            self.save_state()
+            return True
+        except Exception as e:
+            logger.warning(f"Token refresh error: {e}")
+            return False
+
+    def _ensure_valid_token(self):
+        now = int(time.time())
+        if self.session_token and now < (self.session_token_expires_at_epoch - 20):
+            return True
+        return self._refresh_worker_token()
+
+    def _prepare_secure_payload(self, payload, permission):
+        secured = dict(payload)
+        # Always regenerate envelope fields at send time so queued/retried
+        # payloads never fail auth due to stale timestamp/message_id.
+        secured['message_id'] = f"{permission}-{uuid.uuid4().hex[:12]}"
+        secured['timestamp'] = datetime.now().isoformat()
+
+        if permission != 'announce':
+            if not self._ensure_valid_token():
+                return None
+            secured['auth_token'] = self.session_token
+
+        secured['checksum'] = sign_payload(secured)
+        logger.info(
+            "SECURE_ENVELOPE | perm=%s msg=%s ts=%s checksum=%s",
+            permission,
+            secured.get('message_id'),
+            secured.get('timestamp'),
+            str(secured.get('checksum'))[:12]
+        )
+        return secured
 
     def _run_cmd_ok(self, cmd):
         try:
@@ -471,22 +552,65 @@ class WorkerListenerDaemon:
             self.link_metrics['failure_count'] = int(self.link_metrics.get('failure_count', 0)) + 1
             self.link_metrics['last_error'] = str(error or 'unknown-error')
 
-    def _post_json_once(self, url, payload, connect_timeout='5', max_time='15', timeout=20):
+    def _post_json_once(self, url, payload, permission='report', connect_timeout='5', max_time='15', timeout=20):
         start = time.time()
         try:
-            response = subprocess.run([
-                'curl', '-sS', '-X', 'POST',
-                url,
-                '-H', 'Content-Type: application/json',
-                '-d', json.dumps(payload),
-                '--connect-timeout', str(connect_timeout),
-                '--max-time', str(max_time)
-            ], capture_output=True, text=True, timeout=timeout)
+            secured_payload = self._prepare_secure_payload(payload, permission)
+            if not secured_payload:
+                return False, 'token unavailable'
 
-            ok = response.returncode == 0
+            logger.info(
+                "POST_OUT | perm=%s endpoint=%s msg=%s",
+                permission,
+                url,
+                secured_payload.get('message_id')
+            )
+
+            def _send_once(body_payload):
+                return subprocess.run([
+                    'curl', '-sS', '-X', 'POST',
+                    url,
+                    '-H', 'Content-Type: application/json',
+                    '-d', json.dumps(body_payload),
+                    '--connect-timeout', str(connect_timeout),
+                    '--max-time', str(max_time),
+                    '-w', '\n__HTTP_CODE__:%{http_code}'
+                ], capture_output=True, text=True, timeout=timeout)
+
+            response = _send_once(secured_payload)
+            stdout = response.stdout or ''
+            http_code = 0
+            body = stdout
+            marker = '\n__HTTP_CODE__:'
+            if marker in stdout:
+                body, code_str = stdout.rsplit(marker, 1)
+                try:
+                    http_code = int(code_str.strip())
+                except Exception:
+                    http_code = 0
+
+            # Token may have expired between prepare and send; refresh once on 401.
+            if response.returncode == 0 and http_code == 401 and permission != 'announce':
+                if self._refresh_worker_token():
+                    retried_payload = self._prepare_secure_payload(payload, permission)
+                    if retried_payload:
+                        response = _send_once(retried_payload)
+                        stdout = response.stdout or ''
+                        body = stdout
+                        if marker in stdout:
+                            body, code_str = stdout.rsplit(marker, 1)
+                            try:
+                                http_code = int(code_str.strip())
+                            except Exception:
+                                http_code = 0
+
+            ok = response.returncode == 0 and 200 <= http_code < 300
             rtt_ms = (time.time() - start) * 1000.0
-            self._update_link_metrics(ok, rtt_ms=rtt_ms, error=response.stderr.strip())
-            return ok, (response.stderr.strip() or response.stdout.strip())
+            error_text = response.stderr.strip()
+            if not ok and not error_text:
+                error_text = f'HTTP {http_code}: {body.strip()}'
+            self._update_link_metrics(ok, rtt_ms=rtt_ms, error=error_text)
+            return ok, (error_text or body.strip())
         except Exception as e:
             self._update_link_metrics(False, error=e)
             return False, str(e)
@@ -504,8 +628,16 @@ class WorkerListenerDaemon:
         self.pending_outbox.append(item)
         self.save_state()
 
+    def _kind_to_permission(self, kind):
+        mapping = {
+            'benchmark-report': 'report',
+            'task-result': 'task-result',
+            'fl-update': 'fl-update'
+        }
+        return mapping.get(kind, 'report')
+
     def post_or_queue(self, url, payload, kind):
-        ok, msg = self._post_json_once(url, payload)
+        ok, msg = self._post_json_once(url, payload, permission=self._kind_to_permission(kind))
         if ok:
             return True
         logger.warning(f"{kind} immediate post failed; queued for retry: {msg}")
@@ -525,7 +657,11 @@ class WorkerListenerDaemon:
                 remaining.append(item)
                 continue
 
-            ok, msg = self._post_json_once(item['url'], item['payload'])
+            ok, msg = self._post_json_once(
+                item['url'],
+                item['payload'],
+                permission=self._kind_to_permission(item.get('kind'))
+            )
             if ok:
                 changed = True
                 continue
@@ -617,9 +753,12 @@ class WorkerListenerDaemon:
             'worker_id': self.worker_id,
             'mac_address': self.mac_address,
             'hostname': self.hostname,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'message_id': f"announce-{uuid.uuid4().hex[:12]}"
         }
-        announcement['checksum'] = sign_payload(announcement)
+        announcement = self._prepare_secure_payload(announcement, 'announce')
+        if not announcement:
+            return False
 
         backoff = 2
         for attempt in range(1, ANNOUNCE_MAX_RETRIES + 1):
@@ -634,8 +773,21 @@ class WorkerListenerDaemon:
                 ], capture_output=True, text=True, timeout=15)
 
                 if result.returncode == 0:
-                    logger.info("Announcement sent successfully")
-                    return True
+                    try:
+                        data = json.loads(result.stdout or '{}')
+                        if data.get('status') == 'ok':
+                            token_data = data.get('data') or {}
+                            token = token_data.get('auth_token')
+                            token_exp = int(token_data.get('token_expires_at_epoch') or 0)
+                            if token and token_exp > 0:
+                                self.session_token = token
+                                self.session_token_expires_at_epoch = token_exp
+                                self.save_state()
+                            logger.info("Announcement sent successfully")
+                            return True
+                    except Exception:
+                        pass
+                    logger.warning("Announcement response parse failed or rejected")
 
                 logger.warning(
                     f"Announcement attempt {attempt}/{ANNOUNCE_MAX_RETRIES} failed: {result.stderr.strip() or result.stdout.strip()}"
@@ -659,25 +811,17 @@ class WorkerListenerDaemon:
             'live_metrics': self._build_live_metrics(),
             'score_inputs': self._build_score_inputs_snapshot()
         }
-        payload['checksum'] = sign_payload(payload)
-
-        try:
-            result = subprocess.run([
-                'curl', '-sS', '-X', 'POST',
-                f'http://{MASTER_IP}:{MASTER_LISTEN_PORT}/api/worker/heartbeat',
-                '-H', 'Content-Type: application/json',
-                '-d', json.dumps(payload),
-                '--connect-timeout', '3',
-                '--max-time', '8'
-            ], capture_output=True, text=True, timeout=10)
-
-            if result.returncode != 0:
-                logger.debug(f"Heartbeat failed: {result.stderr.strip()}")
-                return False
-            return True
-        except Exception as e:
-            logger.debug(f"Heartbeat error: {e}")
-            return False
+        ok, msg = self._post_json_once(
+            f'http://{MASTER_IP}:{MASTER_LISTEN_PORT}/api/worker/heartbeat',
+            payload,
+            permission='heartbeat',
+            connect_timeout='3',
+            max_time='8',
+            timeout=10
+        )
+        if not ok:
+            logger.debug(f"Heartbeat failed: {msg}")
+        return ok
 
     def send_fl_mock_update(self, round_id):
         """Phase-1 FL scaffold: submit a mock update payload to master."""
@@ -691,7 +835,6 @@ class WorkerListenerDaemon:
             },
             'timestamp': datetime.now().isoformat()
         }
-        update['checksum'] = sign_payload(update)
 
         return self.post_or_queue(
             f'http://{MASTER_IP}:{MASTER_LISTEN_PORT}/api/worker/fl-update',
@@ -712,20 +855,35 @@ class WorkerListenerDaemon:
                 logger.warning("Task command missing required fields")
                 return False
 
+            payload_hash_input = {
+                'task_id': task_id,
+                'job_id': job_id,
+                'chunk_data': chunk_data,
+                'keywords': keywords
+            }
+            computed_task_hash = hashlib.sha256(_canonical_json(payload_hash_input).encode('utf-8')).hexdigest()
+            incoming_task_hash = command.get('task_payload_hash')
+            if incoming_task_hash and incoming_task_hash != computed_task_hash:
+                logger.warning(f"Task payload hash mismatch for {task_id}; dropping task")
+                return False
+
             text_upper = chunk_data.upper()
             result = {
                 'line_count': len([ln for ln in chunk_data.splitlines() if ln.strip()]),
                 'keyword_hits': {kw: text_upper.count(str(kw).upper()) for kw in keywords}
             }
 
+            result_hash = hashlib.sha256(_canonical_json(result).encode('utf-8')).hexdigest()
+
             payload = {
                 'worker_id': self.worker_id,
                 'task_id': task_id,
                 'job_id': job_id,
                 'result': result,
+                'result_hash': result_hash,
+                'result_signature': result_signature(self.worker_id, task_id, result_hash),
                 'timestamp': datetime.now().isoformat()
             }
-            payload['checksum'] = sign_payload(payload)
 
             ok = self.post_or_queue(master_url, payload, 'task-result')
             if ok:
@@ -763,7 +921,6 @@ class WorkerListenerDaemon:
             },
             'timestamp': datetime.now().isoformat()
         }
-        report['checksum'] = sign_payload(report)
 
         # Keep latest benchmark inputs for lightweight heartbeat snapshots.
         self.last_benchmark_report = {
@@ -900,6 +1057,7 @@ class WorkerListenerDaemon:
         """Main listener loop"""
         logger.info("=" * 60)
         logger.info("GridMind Worker Listener Starting")
+        logger.info(f"Version: {PROJECT_VERSION}")
         logger.info(f"Worker ID: {self.worker_id}")
         logger.info(f"MAC Address: {self.mac_address}")
         logger.info(f"Listening on port: {WORKER_LISTEN_PORT}")

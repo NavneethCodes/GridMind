@@ -154,6 +154,10 @@
       const net = si.network || {};
       const dl = Number(net.download_mbps || 0).toFixed(1);
       const ul = Number(net.upload_mbps || 0).toFixed(1);
+      const trustScore = Number(w.trust_score ?? 100).toFixed(0);
+      const quarantineLine = w.quarantined
+        ? `<div class="small" style="color:#fca5a5">Quarantine: yes (${w.quarantine_reason || 'policy'})</div>`
+        : '<div class="small" style="color:#86efac">Quarantine: no</div>';
 
       const clampPercent = (v) => Math.max(0, Math.min(100, Number(v || 0)));
       const pickMeterColor = (value) => {
@@ -204,6 +208,8 @@
           <div class="small">IP: ${w.observed_ip || w.assigned_ip || 'n/a'}</div>
           <div class="small">Score: ${score} | Active Tasks: ${w.active_tasks || 0}</div>
           <div class="small">Join Decision: ${(w.join_state || 'pending')}</div>
+          <div class="small">Trust Score: ${trustScore}/100</div>
+          ${quarantineLine}
           <div class="small">Live: CPU ${cpuNow}% | RAM ${ramNow}%</div>
           <div class="meter-wrap">
             ${meterHtml('CPU Usage', cpuNow)}

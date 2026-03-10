@@ -22,6 +22,7 @@ from threading import Thread, Lock
 import signal
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.parse
+import base64
 
 
 def _load_env_file(path):
@@ -56,6 +57,7 @@ DAEMON_LOG = os.path.join(LOG_DIR, 'master_daemon.log')
 BOOTSTRAP_SCRIPT = os.path.join(GRIDMIND_DIR, 'worker-bootstrap.py')
 POPUP_SCRIPT = os.path.join(GRIDMIND_DIR, 'gridmind-popup-enhanced.py')
 DASHBOARD_HTML = os.path.join(GRIDMIND_DIR, 'static', 'dashboard.html')
+PROJECT_VERSION = "1.0.2"
 
 # Network Configuration
 ROUTER_GATEWAY = os.getenv('ROUTER_GATEWAY', '192.168.0.1')
@@ -93,6 +95,16 @@ SCORE_MEM_SCALE = float(os.getenv('GRIDMIND_SCORE_MEM_SCALE', '100.0'))
 SCORE_NET_SCALE = float(os.getenv('GRIDMIND_SCORE_NET_SCALE', '10.0'))
 SCORE_GAMMA = float(os.getenv('GRIDMIND_SCORE_GAMMA', '1.2'))
 
+# Zero Trust (Layer 1)
+ENFORCE_WORKER_TOKENS = os.getenv('GRIDMIND_ENFORCE_WORKER_TOKENS', 'true').lower() == 'true'
+WORKER_TOKEN_TTL_SECONDS = int(os.getenv('GRIDMIND_WORKER_TOKEN_TTL_SECONDS', '60'))
+WORKER_TOKEN_REFRESH_GRACE_SECONDS = int(os.getenv('GRIDMIND_WORKER_TOKEN_REFRESH_GRACE_SECONDS', '20'))
+TOKEN_CLOCK_SKEW_SECONDS = int(os.getenv('GRIDMIND_TOKEN_CLOCK_SKEW_SECONDS', '90'))
+REPLAY_WINDOW_SECONDS = int(os.getenv('GRIDMIND_REPLAY_WINDOW_SECONDS', '180'))
+TRUST_INITIAL_SCORE = int(os.getenv('GRIDMIND_TRUST_INITIAL_SCORE', '100'))
+TRUST_AUTH_FAIL_PENALTY = int(os.getenv('GRIDMIND_TRUST_AUTH_FAIL_PENALTY', '25'))
+TRUST_QUARANTINE_THRESHOLD = int(os.getenv('GRIDMIND_TRUST_QUARANTINE_THRESHOLD', '40'))
+
 # Ensure directories exist
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -114,6 +126,10 @@ def _canonical_json(payload):
 
 def sign_payload(payload):
     return hashlib.sha256((SHARED_SECRET + _canonical_json(payload)).encode()).hexdigest()
+
+
+def result_signature(worker_id, task_id, result_hash):
+    return hashlib.sha256((SHARED_SECRET + str(worker_id) + str(task_id) + str(result_hash)).encode('utf-8')).hexdigest()
 
 
 def verify_payload_checksum(payload):
@@ -291,8 +307,19 @@ button {{ border:0; border-radius:8px; padding:10px 16px; font-weight:700; curso
                 else:
                     ok, reason = False, 'master unavailable'
                 
+                token_data = None
+                if ok and self.master_daemon:
+                    tok_ok, token, token_exp, tok_reason = self.master_daemon.issue_worker_token(announcement.get('worker_id'))
+                    if tok_ok:
+                        token_data = {'auth_token': token, 'token_expires_at_epoch': token_exp}
+                    else:
+                        reason = f"{reason}; token issue failed: {tok_reason}"
+
                 # Send response
-                self._send_json(200 if ok else 400, {'status': 'ok' if ok else 'error', 'reason': reason})
+                self._send_json(
+                    200 if ok else 400,
+                    {'status': 'ok' if ok else 'error', 'reason': reason, 'data': token_data}
+                )
             
             except Exception as e:
                 logger.error(f"Error handling announcement: {e}")
@@ -304,6 +331,10 @@ button {{ border:0; border-radius:8px; padding:10px 16px; font-weight:700; curso
                 heartbeat['master_observed_ip'] = self.client_address[0]
 
                 if self.master_daemon:
+                    ok_auth, auth_reason = self.master_daemon._enforce_worker_request_or_penalize(heartbeat, 'heartbeat')
+                    if not ok_auth:
+                        self._send_json(401, {'status': 'error', 'reason': auth_reason})
+                        return
                     ok, reason = self.master_daemon.handle_worker_heartbeat(heartbeat)
                 else:
                     ok, reason = False, 'master unavailable'
@@ -318,6 +349,10 @@ button {{ border:0; border-radius:8px; padding:10px 16px; font-weight:700; curso
             try:
                 update = self._read_json_body()
                 if self.master_daemon:
+                    ok_auth, auth_reason = self.master_daemon._enforce_worker_request_or_penalize(update, 'fl-update')
+                    if not ok_auth:
+                        self._send_json(401, {'status': 'error', 'reason': auth_reason})
+                        return
                     ok, reason = self.master_daemon.collect_fl_update(update)
                 else:
                     ok, reason = False, 'master unavailable'
@@ -334,6 +369,10 @@ button {{ border:0; border-radius:8px; padding:10px 16px; font-weight:700; curso
                 report['master_observed_ip'] = self.client_address[0]
 
                 if self.master_daemon:
+                    ok_auth, auth_reason = self.master_daemon._enforce_worker_request_or_penalize(report, 'report')
+                    if not ok_auth:
+                        self._send_json(401, {'status': 'error', 'reason': auth_reason})
+                        return
                     ok, reason = self.master_daemon.handle_worker_report(report)
                 else:
                     ok, reason = False, 'master unavailable'
@@ -364,6 +403,10 @@ button {{ border:0; border-radius:8px; padding:10px 16px; font-weight:700; curso
             try:
                 payload = self._read_json_body()
                 if self.master_daemon:
+                    ok_auth, auth_reason = self.master_daemon._enforce_worker_request_or_penalize(payload, 'task-result')
+                    if not ok_auth:
+                        self._send_json(401, {'status': 'error', 'reason': auth_reason})
+                        return
                     ok, reason = self.master_daemon.handle_task_result(payload)
                 else:
                     ok, reason = False, 'master unavailable'
@@ -405,6 +448,42 @@ button {{ border:0; border-radius:8px; padding:10px 16px; font-weight:700; curso
                 })
             except Exception as e:
                 logger.error(f"Error disconnecting worker: {e}")
+                self.send_response(400)
+                self.end_headers()
+        elif self.path == '/api/worker/token/refresh':
+            try:
+                payload = self._read_json_body()
+                worker_id = payload.get('worker_id')
+                if not worker_id:
+                    self._send_json(400, {'status': 'error', 'reason': 'worker_id is required'})
+                    return
+
+                ok_fields, reason_fields = self.master_daemon._validate_required_fields(
+                    payload,
+                    ['worker_id', 'timestamp', 'message_id', 'checksum']
+                )
+                if not ok_fields:
+                    self._send_json(400, {'status': 'error', 'reason': reason_fields})
+                    return
+                if not verify_payload_checksum(payload):
+                    self._send_json(401, {'status': 'error', 'reason': 'invalid checksum'})
+                    return
+
+                if self.master_daemon:
+                    ok, token, token_exp, reason = self.master_daemon.issue_worker_token(worker_id)
+                else:
+                    ok, token, token_exp, reason = False, None, None, 'master unavailable'
+
+                self._send_json(
+                    200 if ok else 400,
+                    {
+                        'status': 'ok' if ok else 'error',
+                        'reason': reason,
+                        'data': {'auth_token': token, 'token_expires_at_epoch': token_exp} if ok else None
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Error refreshing worker token: {e}")
                 self.send_response(400)
                 self.end_headers()
         elif self.path == '/join':
@@ -480,6 +559,7 @@ class MasterDaemon:
         self.master_benchmark_report = {}
         self.master_cpu_prev_total = None
         self.master_cpu_prev_idle = None
+        self.replay_guard = {}
         self.load_state()
         self.collect_master_benchmark()
         self._read_local_cpu_usage_percent()
@@ -516,6 +596,196 @@ class MasterDaemon:
         if missing:
             return False, f"Missing required fields: {', '.join(missing)}"
         return True, None
+
+    def _utc_now_epoch(self):
+        return int(time.time())
+
+    def _encode_token(self, token_payload):
+        token_json = json.dumps(token_payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        token_b64 = base64.urlsafe_b64encode(token_json).decode('ascii').rstrip('=')
+        signature = hashlib.sha256((SHARED_SECRET + token_b64).encode('utf-8')).hexdigest()
+        return f"{token_b64}.{signature}"
+
+    def _decode_token(self, token):
+        if not token or '.' not in token:
+            return False, None, 'missing or malformed token'
+        try:
+            token_b64, signature = token.rsplit('.', 1)
+            expected = hashlib.sha256((SHARED_SECRET + token_b64).encode('utf-8')).hexdigest()
+            if signature != expected:
+                return False, None, 'token signature invalid'
+
+            padded = token_b64 + '=' * (-len(token_b64) % 4)
+            payload_raw = base64.urlsafe_b64decode(padded.encode('ascii')).decode('utf-8')
+            payload = json.loads(payload_raw)
+            return True, payload, 'ok'
+        except Exception:
+            return False, None, 'token decode failed'
+
+    def _issue_worker_token_locked(self, worker):
+        now = self._utc_now_epoch()
+        worker_id = worker.get('worker_id')
+        token_payload = {
+            'node_id': worker_id,
+            'issued_at': now,
+            'expires_at': now + WORKER_TOKEN_TTL_SECONDS,
+            'permissions': ['heartbeat', 'report', 'task-result', 'fl-update'],
+            'node_hash': hashlib.sha256(f"{worker.get('mac', '')}:{worker_id}".encode('utf-8')).hexdigest(),
+            'jti': f"tok-{uuid.uuid4().hex[:16]}"
+        }
+        token = self._encode_token(token_payload)
+        worker['session_token'] = token
+        worker['session_token_expires_at'] = datetime.fromtimestamp(token_payload['expires_at']).isoformat()
+        worker['session_token_issued_at'] = datetime.fromtimestamp(token_payload['issued_at']).isoformat()
+        worker['session_token_jti'] = token_payload['jti']
+        worker['token_revoked'] = False
+        return token, token_payload['expires_at']
+
+    def _find_worker_by_id_locked(self, worker_id):
+        if not worker_id:
+            return None
+        if worker_id in self.onboarded_workers:
+            return self.onboarded_workers.get(worker_id)
+        for _, worker in self.onboarded_workers.items():
+            if worker.get('worker_id') == worker_id:
+                return worker
+        return None
+
+    def _adjust_worker_trust_locked(self, worker, delta, reason):
+        current = int(worker.get('trust_score', TRUST_INITIAL_SCORE))
+        updated = max(0, min(100, current + int(delta)))
+        worker['trust_score'] = updated
+        worker['trust_updated_at'] = datetime.now().isoformat()
+        if updated <= TRUST_QUARANTINE_THRESHOLD:
+            worker['quarantined'] = True
+            worker['quarantine_reason'] = reason
+        self.audit.log('TRUST', worker.get('worker_id'), f"score={updated} delta={delta} reason={reason}")
+
+    def issue_worker_token(self, worker_id):
+        with self.worker_lock:
+            worker = self._find_worker_by_id_locked(worker_id)
+            if not worker:
+                return False, None, None, 'worker not onboarded'
+            if worker.get('quarantined'):
+                return False, None, None, 'worker quarantined'
+            token, expires_at_epoch = self._issue_worker_token_locked(worker)
+            self.save_state()
+        return True, token, expires_at_epoch, 'token issued'
+
+    def _cleanup_replay_guard(self):
+        now = self._utc_now_epoch()
+        stale = [mid for mid, seen_at in self.replay_guard.items() if (now - int(seen_at)) > REPLAY_WINDOW_SECONDS]
+        for mid in stale:
+            self.replay_guard.pop(mid, None)
+
+    def _verify_worker_request(self, payload, required_permission):
+        if not ENFORCE_WORKER_TOKENS:
+            return True, None, 'ok'
+
+        worker_id = payload.get('worker_id')
+        if not worker_id:
+            return False, None, 'missing worker_id'
+
+        # Zero-trust enforcement starts only after explicit allow.
+        # Pending/denied workers may still send announce/heartbeat during join flow.
+        with self.worker_lock:
+            worker = self._find_worker_by_id_locked(worker_id)
+            if not worker:
+                return False, None, 'worker not onboarded'
+            if worker.get('join_state', 'pending') != 'allowed':
+                return True, None, 'pre-join auth bypass'
+
+        message_id = payload.get('message_id')
+        if not message_id:
+            return False, None, 'missing message_id'
+
+        timestamp_raw = payload.get('timestamp')
+        if not timestamp_raw:
+            return False, None, 'missing timestamp'
+
+        try:
+            payload_ts = int(datetime.fromisoformat(str(timestamp_raw)).timestamp())
+        except Exception:
+            return False, None, 'invalid timestamp format'
+
+        now = self._utc_now_epoch()
+        if abs(now - payload_ts) > TOKEN_CLOCK_SKEW_SECONDS:
+            return False, None, 'timestamp outside allowed skew'
+
+        token = payload.get('auth_token')
+        ok_tok, tok_payload, tok_reason = self._decode_token(token)
+        if not ok_tok:
+            return False, None, tok_reason
+
+        if tok_payload.get('node_id') != worker_id:
+            return False, None, 'token node mismatch'
+
+        perms = tok_payload.get('permissions') or []
+        if required_permission not in perms:
+            return False, None, 'token permission denied'
+
+        exp = int(tok_payload.get('expires_at') or 0)
+        iat = int(tok_payload.get('issued_at') or 0)
+        if now < (iat - TOKEN_CLOCK_SKEW_SECONDS):
+            return False, None, 'token not yet valid'
+        if now > exp:
+            return False, None, 'token expired'
+
+        with self.worker_lock:
+            worker = self._find_worker_by_id_locked(worker_id)
+            if worker.get('quarantined'):
+                return False, worker, 'worker quarantined'
+
+            if worker.get('token_revoked'):
+                return False, worker, 'token revoked'
+
+            if worker.get('session_token_jti') and tok_payload.get('jti') != worker.get('session_token_jti'):
+                return False, worker, 'stale token'
+
+            self._cleanup_replay_guard()
+            if message_id in self.replay_guard:
+                self._adjust_worker_trust_locked(worker, -TRUST_AUTH_FAIL_PENALTY, 'replay detected')
+                self.save_state()
+                return False, worker, 'replay detected'
+            self.replay_guard[message_id] = now
+
+        return True, None, 'ok'
+
+    def _enforce_worker_request_or_penalize(self, payload, permission):
+        ok, worker, reason = self._verify_worker_request(payload, permission)
+        if ok:
+            logger.info(
+                "AUTH_ACCEPT | worker=%s perm=%s msg=%s",
+                payload.get('worker_id') if isinstance(payload, dict) else 'unknown',
+                permission,
+                payload.get('message_id') if isinstance(payload, dict) else None
+            )
+            return True, 'ok'
+
+        worker_id = payload.get('worker_id') if isinstance(payload, dict) else None
+        with self.worker_lock:
+            if worker is None and worker_id:
+                worker = self._find_worker_by_id_locked(worker_id)
+            if worker is not None:
+                # Do not penalize while worker is not yet allowed in join flow.
+                if worker.get('join_state', 'pending') != 'allowed':
+                    logger.info(
+                        "AUTH_REJECT_PREJOIN | worker=%s perm=%s reason=%s",
+                        worker.get('worker_id'),
+                        permission,
+                        reason
+                    )
+                    return False, reason
+                self._adjust_worker_trust_locked(worker, -TRUST_AUTH_FAIL_PENALTY, f'auth failure: {reason}')
+                self.save_state()
+                logger.warning(
+                    "AUTH_REJECT | worker=%s perm=%s reason=%s msg=%s",
+                    worker.get('worker_id'),
+                    permission,
+                    reason,
+                    payload.get('message_id') if isinstance(payload, dict) else None
+                )
+        return False, reason
     
     def get_machine_id(self):
         """Get unique machine identifier"""
@@ -867,7 +1137,11 @@ class MasterDaemon:
                         'worker_score': 0.0,
                         'canary_required': True,
                         'canary_passed_at': None,
-                        'join_state': 'pending'
+                        'join_state': 'pending',
+                        'trust_score': TRUST_INITIAL_SCORE,
+                        'quarantined': False,
+                        'quarantine_reason': None,
+                        'token_revoked': False
                     }
                     self.audit.log('ACCEPTED_AUTO', worker_id, f"Assigned IP: {assigned_ip}")
                     self.mark_topology_dirty('worker joined')
@@ -897,6 +1171,11 @@ class MasterDaemon:
                             worker['status'] = 'online' if worker.get('join_state') == 'allowed' else 'pending'
                         if CONSENT_EVERY_SESSION:
                             worker['canary_required'] = True
+                        # Fresh reconnect starts from clean trust posture until allow.
+                        worker['quarantined'] = False
+                        worker['quarantine_reason'] = None
+                        worker['trust_score'] = TRUST_INITIAL_SCORE
+                        worker['token_revoked'] = False
                         if previous_status != 'online':
                             self.mark_topology_dirty('worker back online')
                         break
@@ -1231,6 +1510,8 @@ class MasterDaemon:
         online = []
         for worker_id, worker in self.onboarded_workers.items():
             if worker.get('status') == 'online' and worker.get('join_state', 'pending') == 'allowed':
+                if worker.get('quarantined'):
+                    continue
                 online.append({
                     'worker_id': worker_id,
                     'benchmark_report': worker.get('benchmark_report', {})
@@ -1247,6 +1528,8 @@ class MasterDaemon:
         with self.worker_lock:
             for worker_id, worker in self.onboarded_workers.items():
                 if worker.get('status') == 'online' and worker.get('join_state', 'pending') == 'allowed':
+                    if worker.get('quarantined'):
+                        continue
                     worker_copy = dict(worker)
                     worker_copy['worker_id'] = worker_id
                     workers.append(worker_copy)
@@ -1333,12 +1616,19 @@ class MasterDaemon:
         return True, {'job_id': job_id, 'tasks': len(chunks)}, 'queued'
 
     def _dispatch_task_to_worker(self, task, worker):
+        payload_hash_input = {
+            'task_id': task['task_id'],
+            'job_id': task['job_id'],
+            'chunk_data': task['chunk_data'],
+            'keywords': task['keywords']
+        }
         payload = {
             'action': 'execute_task',
             'task_id': task['task_id'],
             'job_id': task['job_id'],
             'chunk_data': task['chunk_data'],
             'keywords': task['keywords'],
+            'task_payload_hash': hashlib.sha256(_canonical_json(payload_hash_input).encode('utf-8')).hexdigest(),
             'master_url': f'http://{MASTER_IP}:{MASTER_LISTEN_PORT}/api/worker/task-result'
         }
         ok, reason = self._send_worker_command(worker, payload)
@@ -1484,6 +1774,17 @@ class MasterDaemon:
         if not verify_payload_checksum(payload):
             return False, 'invalid checksum'
 
+        result_obj = payload.get('result')
+        claimed_hash = payload.get('result_hash')
+        claimed_sig = payload.get('result_signature')
+        if claimed_hash and claimed_sig:
+            computed_hash = hashlib.sha256(_canonical_json(result_obj).encode('utf-8')).hexdigest()
+            if computed_hash != claimed_hash:
+                return False, 'result hash mismatch'
+            expected_sig = result_signature(payload.get('worker_id'), payload.get('task_id'), claimed_hash)
+            if expected_sig != claimed_sig:
+                return False, 'result signature invalid'
+
         task_id = payload.get('task_id')
         job_id = payload.get('job_id')
 
@@ -1564,6 +1865,9 @@ class MasterDaemon:
                 'join_state': 'allowed',
                 'is_master': True,
                 'benchmark_updated_at': self.master_benchmark_report.get('timestamp'),
+                'trust_score': 100,
+                'quarantined': False,
+                'quarantine_reason': None,
                 'benchmark_report': self.master_benchmark_report or {},
                 'score_inputs': {
                     'cpu_cores': (self.master_benchmark_report or {}).get('cpu_cores'),
@@ -1621,6 +1925,9 @@ class MasterDaemon:
                     'join_state': worker.get('join_state', 'pending'),
                     'is_master': False,
                     'benchmark_updated_at': worker.get('benchmark_updated_at'),
+                    'trust_score': worker.get('trust_score', TRUST_INITIAL_SCORE),
+                    'quarantined': worker.get('quarantined', False),
+                    'quarantine_reason': worker.get('quarantine_reason'),
                     'benchmark_report': worker.get('benchmark_report', {}),
                     'score_inputs': {
                         'cpu_cores': (worker.get('benchmark_report') or {}).get('cpu_cores') if isinstance(worker.get('benchmark_report'), dict) else None,
@@ -1679,6 +1986,15 @@ class MasterDaemon:
             worker['join_state_updated_at'] = datetime.now().isoformat()
             self.save_state()
 
+        logger.info(
+            "Join state updated | worker_id=%s hostname=%s %s->%s status=%s",
+            worker_id,
+            worker.get('hostname'),
+            current,
+            join_state,
+            worker.get('status')
+        )
+
         if should_refresh_benchmark:
             self.mark_topology_dirty('worker allowed')
         return True, 'updated'
@@ -1715,6 +2031,7 @@ class MasterDaemon:
             worker['join_state'] = 'denied'
             worker['status'] = 'disconnected' if ok_cmd else 'offline'
             worker['join_state_updated_at'] = datetime.now().isoformat()
+            worker['token_revoked'] = True
             self.save_state()
 
         self.mark_topology_dirty('worker safety disconnected')
@@ -1951,6 +2268,7 @@ class MasterDaemon:
         """Main daemon loop"""
         logger.info("=" * 60)
         logger.info("GridMind Master Daemon Starting (Lab 1 Rework)")
+        logger.info(f"Version: {PROJECT_VERSION}")
         logger.info(f"Master ID: {self.master_id}")
         logger.info(f"Master IP: {MASTER_IP}")
         logger.info(f"Listening on port: {MASTER_LISTEN_PORT}")

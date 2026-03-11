@@ -155,8 +155,10 @@
       const dl = Number(net.download_mbps || 0).toFixed(1);
       const ul = Number(net.upload_mbps || 0).toFixed(1);
       const trustScore = Number(w.trust_score ?? 100).toFixed(0);
+      const quarantineRelease = formatDateTime(w.quarantine_release_at);
       const quarantineLine = w.quarantined
         ? `<div class="small" style="color:#fca5a5">Quarantine: yes (${w.quarantine_reason || 'policy'})</div>`
+          + `<div class="small" style="color:#fca5a5">Release At: ${quarantineRelease}</div>`
         : '<div class="small" style="color:#86efac">Quarantine: no</div>';
 
       const clampPercent = (v) => Math.max(0, Math.min(100, Number(v || 0)));
@@ -192,7 +194,10 @@
       const cardClass = isMaster ? 'worker master-card' : 'worker';
       const actionHtml = isMaster
         ? ''
-        : `<div class="small-actions"><button class="tiny-btn" onclick="disconnectWorker('${w.worker_id}')">Safety Disconnect</button></div>`;
+        : `<div class="small-actions">`
+          + `<button class="tiny-btn" onclick="disconnectWorker('${w.worker_id}')">Safety Disconnect</button>`
+          + (w.quarantined ? `<button class="tiny-btn" style="border-color:#14532d;background:#052e16;color:#bbf7d0" onclick="unquarantineWorker('${w.worker_id}')">Unquarantine</button>` : '')
+          + `</div>`;
       const lastSeenText = formatDateTime(w.last_seen);
       const benchmarkUpdatedText = formatDateTime(w.benchmark_updated_at);
 
@@ -302,8 +307,39 @@
       }
     }
 
+    async function unquarantineWorker(workerId) {
+      actionMsg.textContent = `Unquarantining ${workerId}...`;
+      try {
+        const res = await fetch('/api/master/worker/unquarantine', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ worker_id: workerId })
+        });
+        const json = await res.json();
+        if (json.status !== 'ok') {
+          const reason = json.reason || 'unquarantine failed';
+          if (reason.includes('cooldown active')) {
+            const forceRes = await fetch('/api/master/worker/unquarantine', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ worker_id: workerId, force: true, note: 'dashboard-force-unquarantine' })
+            });
+            const forceJson = await forceRes.json();
+            if (forceJson.status !== 'ok') throw new Error(forceJson.reason || reason);
+          } else {
+            throw new Error(reason);
+          }
+        }
+        actionMsg.textContent = `Worker ${workerId} unquarantined`;
+        await refresh();
+      } catch (e) {
+        errorEl.textContent = `Unquarantine error: ${e.message}`;
+      }
+    }
+
     refreshBenchBtn.addEventListener('click', refreshBenchmarksNow);
     window.disconnectWorker = disconnectWorker;
+    window.unquarantineWorker = unquarantineWorker;
 
     refresh();
     setInterval(refresh, 2000);

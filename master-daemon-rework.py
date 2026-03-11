@@ -57,7 +57,7 @@ DAEMON_LOG = os.path.join(LOG_DIR, 'master_daemon.log')
 BOOTSTRAP_SCRIPT = os.path.join(GRIDMIND_DIR, 'worker-bootstrap.py')
 POPUP_SCRIPT = os.path.join(GRIDMIND_DIR, 'gridmind-popup-enhanced.py')
 DASHBOARD_HTML = os.path.join(GRIDMIND_DIR, 'static', 'dashboard.html')
-PROJECT_VERSION = "1.0.2"
+PROJECT_VERSION = "1.0.4"
 
 # Network Configuration
 ROUTER_GATEWAY = os.getenv('ROUTER_GATEWAY', '192.168.0.1')
@@ -104,6 +104,15 @@ REPLAY_WINDOW_SECONDS = int(os.getenv('GRIDMIND_REPLAY_WINDOW_SECONDS', '180'))
 TRUST_INITIAL_SCORE = int(os.getenv('GRIDMIND_TRUST_INITIAL_SCORE', '100'))
 TRUST_AUTH_FAIL_PENALTY = int(os.getenv('GRIDMIND_TRUST_AUTH_FAIL_PENALTY', '25'))
 TRUST_QUARANTINE_THRESHOLD = int(os.getenv('GRIDMIND_TRUST_QUARANTINE_THRESHOLD', '40'))
+TRUST_QUARANTINE_COOLDOWN_SECONDS = int(os.getenv('GRIDMIND_TRUST_QUARANTINE_COOLDOWN_SECONDS', '120'))
+
+# Layer 2 policy matrix: only these permissions are valid for worker-originated calls.
+WORKER_PERMISSION_SET = {
+    'heartbeat',
+    'report',
+    'task-result',
+    'fl-update'
+}
 
 # Ensure directories exist
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
@@ -450,6 +459,27 @@ button {{ border:0; border-radius:8px; padding:10px 16px; font-weight:700; curso
                 logger.error(f"Error disconnecting worker: {e}")
                 self.send_response(400)
                 self.end_headers()
+        elif self.path == '/api/master/worker/unquarantine':
+            try:
+                payload = self._read_json_body()
+                worker_id = payload.get('worker_id')
+                force = bool(payload.get('force', False))
+                note = payload.get('note')
+
+                if self.master_daemon:
+                    ok, reason = self.master_daemon.unquarantine_worker_with_policy(worker_id, force=force, note=note)
+                else:
+                    ok, reason = False, 'master unavailable'
+
+                self._send_json(200 if ok else 400, {
+                    'status': 'ok' if ok else 'error',
+                    'reason': reason,
+                    'data': {'worker_id': worker_id, 'force': force}
+                })
+            except Exception as e:
+                logger.error(f"Error unquarantining worker: {e}")
+                self.send_response(400)
+                self.end_headers()
         elif self.path == '/api/worker/token/refresh':
             try:
                 payload = self._read_json_body()
@@ -659,6 +689,10 @@ class MasterDaemon:
         if updated <= TRUST_QUARANTINE_THRESHOLD:
             worker['quarantined'] = True
             worker['quarantine_reason'] = reason
+            worker['quarantined_at'] = datetime.now().isoformat()
+            worker['quarantine_release_at'] = datetime.fromtimestamp(
+                self._utc_now_epoch() + TRUST_QUARANTINE_COOLDOWN_SECONDS
+            ).isoformat()
         self.audit.log('TRUST', worker.get('worker_id'), f"score={updated} delta={delta} reason={reason}")
 
     def issue_worker_token(self, worker_id):
@@ -681,6 +715,9 @@ class MasterDaemon:
     def _verify_worker_request(self, payload, required_permission):
         if not ENFORCE_WORKER_TOKENS:
             return True, None, 'ok'
+
+        if required_permission not in WORKER_PERMISSION_SET:
+            return False, None, f'unknown permission mapping: {required_permission}'
 
         worker_id = payload.get('worker_id')
         if not worker_id:
@@ -721,6 +758,9 @@ class MasterDaemon:
             return False, None, 'token node mismatch'
 
         perms = tok_payload.get('permissions') or []
+        for perm in perms:
+            if perm not in WORKER_PERMISSION_SET:
+                return False, None, 'token contains unsupported permission'
         if required_permission not in perms:
             return False, None, 'token permission denied'
 
@@ -734,6 +774,9 @@ class MasterDaemon:
         with self.worker_lock:
             worker = self._find_worker_by_id_locked(worker_id)
             if worker.get('quarantined'):
+                release_at_str = worker.get('quarantine_release_at')
+                if release_at_str:
+                    return False, worker, f"worker quarantined until {release_at_str}"
                 return False, worker, 'worker quarantined'
 
             if worker.get('token_revoked'):
@@ -1141,6 +1184,8 @@ class MasterDaemon:
                         'trust_score': TRUST_INITIAL_SCORE,
                         'quarantined': False,
                         'quarantine_reason': None,
+                        'quarantined_at': None,
+                        'quarantine_release_at': None,
                         'token_revoked': False
                     }
                     self.audit.log('ACCEPTED_AUTO', worker_id, f"Assigned IP: {assigned_ip}")
@@ -1174,6 +1219,8 @@ class MasterDaemon:
                         # Fresh reconnect starts from clean trust posture until allow.
                         worker['quarantined'] = False
                         worker['quarantine_reason'] = None
+                        worker['quarantined_at'] = None
+                        worker['quarantine_release_at'] = None
                         worker['trust_score'] = TRUST_INITIAL_SCORE
                         worker['token_revoked'] = False
                         if previous_status != 'online':
@@ -1928,6 +1975,8 @@ class MasterDaemon:
                     'trust_score': worker.get('trust_score', TRUST_INITIAL_SCORE),
                     'quarantined': worker.get('quarantined', False),
                     'quarantine_reason': worker.get('quarantine_reason'),
+                    'quarantined_at': worker.get('quarantined_at'),
+                    'quarantine_release_at': worker.get('quarantine_release_at'),
                     'benchmark_report': worker.get('benchmark_report', {}),
                     'score_inputs': {
                         'cpu_cores': (worker.get('benchmark_report') or {}).get('cpu_cores') if isinstance(worker.get('benchmark_report'), dict) else None,
@@ -2038,6 +2087,46 @@ class MasterDaemon:
         if ok_cmd:
             return True, 'worker session terminated'
         return False, f'safety policy applied, but terminate command failed: {cmd_reason}'
+
+    def unquarantine_worker(self, worker_id):
+        return self.unquarantine_worker_with_policy(worker_id, force=False, note=None)
+
+    def unquarantine_worker_with_policy(self, worker_id, force=False, note=None):
+        if not worker_id:
+            return False, 'worker_id is required'
+
+        with self.worker_lock:
+            worker = self.onboarded_workers.get(worker_id)
+            if not worker:
+                return False, 'worker not onboarded'
+
+            release_at_str = worker.get('quarantine_release_at')
+            if worker.get('quarantined') and release_at_str and not force:
+                try:
+                    release_epoch = int(datetime.fromisoformat(release_at_str).timestamp())
+                    now_epoch = self._utc_now_epoch()
+                    if now_epoch < release_epoch:
+                        wait_sec = max(0, release_epoch - now_epoch)
+                        return False, f'cooldown active, try again in {wait_sec}s or use force=true'
+                except Exception:
+                    pass
+
+            worker['quarantined'] = False
+            worker['quarantine_reason'] = None
+            worker['quarantined_at'] = None
+            worker['quarantine_release_at'] = None
+            worker['trust_score'] = TRUST_INITIAL_SCORE
+            worker['token_revoked'] = False
+            worker['trust_updated_at'] = datetime.now().isoformat()
+            self.save_state()
+
+        detail = 'manual release by operator'
+        if force:
+            detail += ' (forced)'
+        if note:
+            detail += f' note={note}'
+        self.audit.log('UNQUARANTINE', worker_id, detail)
+        return True, 'worker unquarantined'
 
     def get_cluster_overview(self):
         ok, workers_data, reason = self.get_workers_status()

@@ -50,7 +50,7 @@ WORKER_HOME = os.path.expanduser('~')
 GRIDMIND_DIR = os.path.join(WORKER_HOME, '.gridmind')
 LOG_FILE = os.path.join(GRIDMIND_DIR, 'worker_listener.log')
 STATE_FILE = os.path.join(GRIDMIND_DIR, 'listener_state.json')
-PROJECT_VERSION = "1.0.2"
+PROJECT_VERSION = "1.0.4"
 
 # Master discovery
 MASTER_IP = os.getenv('GRIDMIND_MASTER_IP') or os.getenv('MASTER_NODE_IP', '192.168.0.10')

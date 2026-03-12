@@ -16,7 +16,7 @@ import logging
 import hashlib
 import platform
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import signal
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -50,7 +50,7 @@ WORKER_HOME = os.path.expanduser('~')
 GRIDMIND_DIR = os.path.join(WORKER_HOME, '.gridmind')
 LOG_FILE = os.path.join(GRIDMIND_DIR, 'worker_listener.log')
 STATE_FILE = os.path.join(GRIDMIND_DIR, 'listener_state.json')
-PROJECT_VERSION = "1.0.4"
+PROJECT_VERSION = "1.1.2"
 
 # Master discovery
 MASTER_IP = os.getenv('GRIDMIND_MASTER_IP') or os.getenv('MASTER_NODE_IP', '192.168.0.10')
@@ -330,7 +330,8 @@ class WorkerListenerDaemon:
         try:
             payload = {
                 'worker_id': self.worker_id,
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'timestamp_epoch': int(time.time()),
                 'message_id': f"tok-{uuid.uuid4().hex[:12]}"
             }
             payload['checksum'] = sign_payload(payload)
@@ -378,7 +379,8 @@ class WorkerListenerDaemon:
         # Always regenerate envelope fields at send time so queued/retried
         # payloads never fail auth due to stale timestamp/message_id.
         secured['message_id'] = f"{permission}-{uuid.uuid4().hex[:12]}"
-        secured['timestamp'] = datetime.now().isoformat()
+        secured['timestamp'] = datetime.now(timezone.utc).isoformat()
+        secured['timestamp_epoch'] = int(time.time())
 
         if permission != 'announce':
             if not self._ensure_valid_token():
@@ -390,7 +392,7 @@ class WorkerListenerDaemon:
             "SECURE_ENVELOPE | perm=%s msg=%s ts=%s checksum=%s",
             permission,
             secured.get('message_id'),
-            secured.get('timestamp'),
+            f"{secured.get('timestamp')} (epoch={secured.get('timestamp_epoch')})",
             str(secured.get('checksum'))[:12]
         )
         return secured

@@ -17,12 +17,13 @@ import hashlib
 import uuid
 import platform
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from threading import Thread, Lock
 import signal
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.parse
 import base64
+import hmac
 
 
 def _load_env_file(path):
@@ -57,7 +58,7 @@ DAEMON_LOG = os.path.join(LOG_DIR, 'master_daemon.log')
 BOOTSTRAP_SCRIPT = os.path.join(GRIDMIND_DIR, 'worker-bootstrap.py')
 POPUP_SCRIPT = os.path.join(GRIDMIND_DIR, 'gridmind-popup-enhanced.py')
 DASHBOARD_HTML = os.path.join(GRIDMIND_DIR, 'static', 'dashboard.html')
-PROJECT_VERSION = "1.0.4"
+PROJECT_VERSION = "1.1.2"
 
 # Network Configuration
 ROUTER_GATEWAY = os.getenv('ROUTER_GATEWAY', '192.168.0.1')
@@ -99,7 +100,16 @@ SCORE_GAMMA = float(os.getenv('GRIDMIND_SCORE_GAMMA', '1.2'))
 ENFORCE_WORKER_TOKENS = os.getenv('GRIDMIND_ENFORCE_WORKER_TOKENS', 'true').lower() == 'true'
 WORKER_TOKEN_TTL_SECONDS = int(os.getenv('GRIDMIND_WORKER_TOKEN_TTL_SECONDS', '60'))
 WORKER_TOKEN_REFRESH_GRACE_SECONDS = int(os.getenv('GRIDMIND_WORKER_TOKEN_REFRESH_GRACE_SECONDS', '20'))
-TOKEN_CLOCK_SKEW_SECONDS = int(os.getenv('GRIDMIND_TOKEN_CLOCK_SKEW_SECONDS', '90'))
+# Accept moderate clock drift across lab machines (default 10-minute waveoff).
+# Backward compatible env precedence:
+# 1) GRIDMIND_TIME_WAVEOFF_SECONDS (new)
+# 2) GRIDMIND_TOKEN_CLOCK_SKEW_SECONDS (legacy)
+TOKEN_CLOCK_SKEW_SECONDS = int(
+    os.getenv(
+        'GRIDMIND_TIME_WAVEOFF_SECONDS',
+        os.getenv('GRIDMIND_TOKEN_CLOCK_SKEW_SECONDS', '600')
+    )
+)
 REPLAY_WINDOW_SECONDS = int(os.getenv('GRIDMIND_REPLAY_WINDOW_SECONDS', '180'))
 TRUST_INITIAL_SCORE = int(os.getenv('GRIDMIND_TRUST_INITIAL_SCORE', '100'))
 TRUST_AUTH_FAIL_PENALTY = int(os.getenv('GRIDMIND_TRUST_AUTH_FAIL_PENALTY', '25'))
@@ -113,6 +123,10 @@ WORKER_PERMISSION_SET = {
     'task-result',
     'fl-update'
 }
+
+# Layer 3: control-plane hardening for operator endpoints.
+MASTER_ADMIN_API_KEY = str(os.getenv('GRIDMIND_ADMIN_API_KEY', '')).strip()
+ENFORCE_MASTER_ADMIN_KEY = os.getenv('GRIDMIND_ENFORCE_ADMIN_KEY', 'false').lower() == 'true'
 
 # Ensure directories exist
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
@@ -189,6 +203,23 @@ class WorkerAnnounceHandler(BaseHTTPRequestHandler):
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
         self.wfile.write(html.encode('utf-8'))
+
+    def _is_admin_authorized(self):
+        if not ENFORCE_MASTER_ADMIN_KEY:
+            return True
+        if not MASTER_ADMIN_API_KEY:
+            return False
+
+        provided = self.headers.get('X-GridMind-Admin-Key', '')
+        if not provided:
+            return False
+        return hmac.compare_digest(str(provided), MASTER_ADMIN_API_KEY)
+
+    def _require_admin_or_reject(self):
+        if self._is_admin_authorized():
+            return True
+        self._send_json(403, {'status': 'error', 'reason': 'admin authorization required'})
+        return False
 
     def _join_page_html(self, worker_id, state):
         state_text = state or 'pending'
@@ -287,6 +318,12 @@ button {{ border:0; border-radius:8px; padding:10px 16px; font-weight:700; curso
                 self._send_json(503, {'status': 'error', 'reason': 'master unavailable'})
                 return
             ok, data, reason = self.master_daemon.get_cluster_overview()
+            self._send_json(200 if ok else 400, {'status': 'ok' if ok else 'error', 'reason': reason, 'data': data})
+        elif parsed.path == '/api/master/security-status':
+            if not self.master_daemon:
+                self._send_json(503, {'status': 'error', 'reason': 'master unavailable'})
+                return
+            ok, data, reason = self.master_daemon.get_security_status()
             self._send_json(200 if ok else 400, {'status': 'ok' if ok else 'error', 'reason': reason, 'data': data})
         elif parsed.path == '/api/worker/consent-status':
             if not self.master_daemon:
@@ -393,6 +430,8 @@ button {{ border:0; border-radius:8px; padding:10px 16px; font-weight:700; curso
                 self.end_headers()
         elif self.path == '/api/master/jobs/submit':
             try:
+                if not self._require_admin_or_reject():
+                    return
                 payload = self._read_json_body()
 
                 if self.master_daemon:
@@ -427,6 +466,8 @@ button {{ border:0; border-radius:8px; padding:10px 16px; font-weight:700; curso
                 self.end_headers()
         elif self.path == '/api/master/benchmarks/refresh':
             try:
+                if not self._require_admin_or_reject():
+                    return
                 if self.master_daemon:
                     ok, data, reason = self.master_daemon.refresh_benchmarks_now()
                 else:
@@ -442,6 +483,8 @@ button {{ border:0; border-radius:8px; padding:10px 16px; font-weight:700; curso
                 self.end_headers()
         elif self.path == '/api/master/worker/disconnect':
             try:
+                if not self._require_admin_or_reject():
+                    return
                 payload = self._read_json_body()
                 worker_id = payload.get('worker_id')
 
@@ -461,6 +504,8 @@ button {{ border:0; border-radius:8px; padding:10px 16px; font-weight:700; curso
                 self.end_headers()
         elif self.path == '/api/master/worker/unquarantine':
             try:
+                if not self._require_admin_or_reject():
+                    return
                 payload = self._read_json_body()
                 worker_id = payload.get('worker_id')
                 force = bool(payload.get('force', False))
@@ -736,14 +781,26 @@ class MasterDaemon:
         if not message_id:
             return False, None, 'missing message_id'
 
-        timestamp_raw = payload.get('timestamp')
-        if not timestamp_raw:
-            return False, None, 'missing timestamp'
-
-        try:
-            payload_ts = int(datetime.fromisoformat(str(timestamp_raw)).timestamp())
-        except Exception:
-            return False, None, 'invalid timestamp format'
+        payload_ts = None
+        timestamp_epoch_raw = payload.get('timestamp_epoch')
+        if timestamp_epoch_raw is not None:
+            try:
+                payload_ts = int(float(timestamp_epoch_raw))
+            except Exception:
+                return False, None, 'invalid timestamp_epoch format'
+        else:
+            timestamp_raw = payload.get('timestamp')
+            if not timestamp_raw:
+                return False, None, 'missing timestamp'
+            try:
+                parsed = datetime.fromisoformat(str(timestamp_raw))
+                # Legacy payloads may send naive datetime strings.
+                # Treat naive values as UTC to avoid cross-timezone skew.
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                payload_ts = int(parsed.timestamp())
+            except Exception:
+                return False, None, 'invalid timestamp format'
 
         now = self._utc_now_epoch()
         if abs(now - payload_ts) > TOKEN_CLOCK_SKEW_SECONDS:
@@ -2159,6 +2216,21 @@ class MasterDaemon:
 
         return True, {'summary': summary, 'master': master, 'workers': workers_data.get('workers', [])}, 'ok'
 
+    def get_security_status(self):
+        data = {
+            'version': PROJECT_VERSION,
+            'worker_token_enforced': ENFORCE_WORKER_TOKENS,
+            'worker_permission_matrix_size': len(WORKER_PERMISSION_SET),
+            'replay_window_seconds': REPLAY_WINDOW_SECONDS,
+            'timestamp_waveoff_seconds': TOKEN_CLOCK_SKEW_SECONDS,
+            'token_ttl_seconds': WORKER_TOKEN_TTL_SECONDS,
+            'trust_threshold': TRUST_QUARANTINE_THRESHOLD,
+            'trust_cooldown_seconds': TRUST_QUARANTINE_COOLDOWN_SECONDS,
+            'admin_key_enforced': ENFORCE_MASTER_ADMIN_KEY,
+            'admin_key_configured': bool(MASTER_ADMIN_API_KEY)
+        }
+        return True, data, 'ok'
+
     def get_job_status(self, job_id):
         if not job_id:
             return False, None, 'job_id is required'
@@ -2358,6 +2430,11 @@ class MasterDaemon:
         logger.info("=" * 60)
         logger.info("GridMind Master Daemon Starting (Lab 1 Rework)")
         logger.info(f"Version: {PROJECT_VERSION}")
+        logger.info(
+            "Layer3: admin-key enforcement=%s configured=%s",
+            ENFORCE_MASTER_ADMIN_KEY,
+            bool(MASTER_ADMIN_API_KEY)
+        )
         logger.info(f"Master ID: {self.master_id}")
         logger.info(f"Master IP: {MASTER_IP}")
         logger.info(f"Listening on port: {MASTER_LISTEN_PORT}")

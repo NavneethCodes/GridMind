@@ -1,0 +1,9 @@
+# Replace placeholders with actual GitHub usernames
+# Example: @yourname @collab1 @collab2 @collab3
+
+* @YOUR_GITHUB_USERNAME @COLLABORATOR_1 @COLLABORATOR_2 @COLLABORATOR_3
+
+# Optional ownership split by track
+# /master-daemon-rework.py @COLLABORATOR_3
+# /worker-listener-daemon.py @COLLABORATOR_2
+# /jobs/ @COLLABORATOR_1

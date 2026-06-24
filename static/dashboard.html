@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GridMind Master Dashboard</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #111827;
+      --muted: #9ca3af;
+      --text: #f9fafb;
+      --green: #22c55e;
+      --yellow: #eab308;
+      --red: #ef4444;
+      --orange: #f59e0b;
+      --blue: #3b82f6;
+      --border: #1f2937;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Inter, system-ui, sans-serif; background: var(--bg); color: var(--text); }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 20px; }
+    h1 { margin: 0 0 14px; font-size: 1.5rem; }
+    .sub { color: var(--muted); margin-bottom: 18px; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
+    .metric { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+    .metric .k { color: var(--muted); font-size: .85rem; }
+    .metric .v { font-size: 1.25rem; font-weight: 700; margin-top: 4px; }
+    .panel { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+    .workers { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 12px; }
+    .worker { border: 1px solid var(--border); border-radius: 10px; padding: 12px; background: #0b1220; }
+    .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .name { font-weight: 700; }
+    .muted { color: var(--muted); font-size: .85rem; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+    .available { background: var(--green); }
+    .busy { background: var(--yellow); }
+    .pending { background: var(--orange); }
+    .offline { background: var(--red); }
+    .state { font-weight: 600; text-transform: capitalize; }
+    .bar { height: 8px; background: #1f2937; border-radius: 999px; overflow: hidden; margin-top: 8px; }
+    .fill { height: 100%; background: var(--blue); width: 0%; transition: width .25s ease; }
+    .small { font-size: .8rem; color: var(--muted); margin-top: 6px; }
+    .error { color: #fecaca; }
+    .actions { display: flex; gap: 10px; margin-bottom: 12px; }
+    .btn { border: 1px solid var(--border); background: #0b1220; color: var(--text); border-radius: 8px; padding: 8px 12px; cursor: pointer; font-weight: 600; }
+    .btn:hover { border-color: #334155; }
+    .okline { color: #86efac; font-size: .9rem; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>GridMind Master Dashboard</h1>
+    <div class="sub">Real-time cluster status (auto refresh every 2 seconds)</div>
+
+    <div class="actions">
+      <button id="refreshBenchBtn" class="btn">Update Benchmarks</button>
+      <div id="actionMsg" class="okline"></div>
+    </div>
+
+    <div class="grid" id="summary"></div>
+
+    <div class="panel">
+      <h3 style="margin-top:0">Workers</h3>
+      <div id="workers" class="workers"></div>
+      <div id="error" class="error muted" style="margin-top:10px"></div>
+    </div>
+  </div>
+
+  <script>
+    const summaryEl = document.getElementById('summary');
+    const workersEl = document.getElementById('workers');
+    const errorEl = document.getElementById('error');
+    const refreshBenchBtn = document.getElementById('refreshBenchBtn');
+    const actionMsg = document.getElementById('actionMsg');
+
+    function metricCard(k, v) {
+      return `<div class="metric"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+    }
+
+    function statusPill(status) {
+      const st = (status || 'offline').toLowerCase();
+      const cls = st === 'online' ? 'available' : 'offline';
+      return `<span class="dot ${cls}"></span>${st}`;
+    }
+
+    function workerCard(w) {
+      const st = w.activity_state || 'offline';
+      const score = Number(w.worker_score || 0).toFixed(2);
+      const load = Number(w.load_percent || 0);
+      const dotClass = st === 'available'
+        ? 'available'
+        : (st === 'busy'
+          ? 'busy'
+          : (st === 'pending' ? 'pending' : 'offline'));
+
+      return `
+        <div class="worker">
+          <div class="row">
+            <div>
+              <div class="name">${w.hostname || w.worker_id}</div>
+              <div class="muted">${w.worker_id}</div>
+            </div>
+            <div class="state"><span class="dot ${dotClass}"></span>${st}</div>
+          </div>
+          <div class="small">IP: ${w.observed_ip || w.assigned_ip || 'n/a'}</div>
+          <div class="small">Score: ${score} | Active Tasks: ${w.active_tasks || 0}</div>
+          <div class="small">Join Decision: ${(w.join_state || 'pending')}</div>
+          <div class="bar"><div class="fill" style="width:${load}%"></div></div>
+          <div class="small">Load: ${load}% | Last seen: ${w.last_seen || 'n/a'}</div>
+        </div>
+      `;
+    }
+
+    async function refresh() {
+      try {
+        const res = await fetch('/api/master/overview', { cache: 'no-store' });
+        const json = await res.json();
+        if (json.status !== 'ok') throw new Error(json.reason || 'overview failed');
+
+        const data = json.data || {};
+        const s = data.summary || {};
+        const m = data.master || {};
+        const workers = data.workers || [];
+
+        summaryEl.innerHTML = [
+          metricCard('Master Status', statusPill(m.status || s.master_status || 'offline')),
+          metricCard('Workers (Onboarded)', s.onboarded_workers ?? 0),
+          metricCard('Tasks Active', s.tasks_active ?? 0),
+          metricCard('Tasks Pending', s.tasks_pending ?? 0),
+          metricCard('Tasks Completed', s.tasks_completed ?? 0),
+          metricCard('Jobs Total', s.jobs_total ?? 0),
+          metricCard('Workers (Detected)', s.detected_workers ?? 0),
+        ].join('');
+
+        workersEl.innerHTML = workers.length
+          ? workers.map(workerCard).join('')
+          : '<div class="muted">No workers available.</div>';
+
+        errorEl.textContent = '';
+      } catch (e) {
+        errorEl.textContent = `Dashboard refresh error: ${e.message}`;
+      }
+    }
+
+    async function refreshBenchmarksNow() {
+      refreshBenchBtn.disabled = true;
+      actionMsg.textContent = 'Requesting benchmark refresh...';
+      try {
+        const res = await fetch('/api/master/benchmarks/refresh', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}'
+        });
+        const json = await res.json();
+        if (json.status !== 'ok') throw new Error(json.reason || 'refresh failed');
+        const d = json.data || {};
+        actionMsg.textContent = `Requested: ${d.dispatched ?? 0}/${d.online_workers ?? 0} workers`;
+        await refresh();
+      } catch (e) {
+        actionMsg.textContent = '';
+        errorEl.textContent = `Benchmark refresh error: ${e.message}`;
+      } finally {
+        refreshBenchBtn.disabled = false;
+      }
+    }
+
+    refreshBenchBtn.addEventListener('click', refreshBenchmarksNow);
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

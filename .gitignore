@@ -1,0 +1,59 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and local installs
+venv/
+.venv/
+env/
+myenv/
+GridMinds/
+.gridmind/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs and runtime artifacts
+logs/
+master_logs/
+*.log
+agent_log.txt
+agent_report.json
+worker_listener.log
+
+# State / generated runtime files
+master_state.json
+*.pid
+*.sqlite3
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# IDE/editor
+.idea/
+.vscode/
+.history/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary and cache folders
+tmp/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+
+# Optional generated content
+static/files/
